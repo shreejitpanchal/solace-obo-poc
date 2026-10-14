@@ -1,0 +1,58 @@
+[project]
+name = "solace-obo-poc"
+version = "0.1.0"
+description = "POC: on-behalf-of (OBO) token propagation through Solace PubSub+ with a validator hop"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "solace-pubsubplus>=1.9",
+  "pyjwt[crypto]>=2.10",
+  "fastapi>=0.115",
+  "uvicorn>=0.34",
+  "httpx>=0.28",
+]
+
+# One console script per box in the POC diagram, plus the token issuer.
+[project.scripts]
+obo-issuer = "solace_obo_poc.issuer:main"
+obo-publisher = "solace_obo_poc.publisher:main"
+obo-validator = "solace_obo_poc.validator:main"
+obo-recipient = "solace_obo_poc.recipient:main"
+obo-profiler = "solace_obo_poc.profiler:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.11",
+  "pip-audit>=2.9",
+  "pyinstaller>=6.11",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/solace_obo_poc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["build", "dist", "graphify-out"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["solace_obo_poc", "scripts"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

@@ -1,0 +1,157 @@
+# Whole POC in containers: issuer, validator, recipient, user-profiler, a
+# one-shot publisher, and optionally the broker itself.
+#
+# Broker, two modes, chosen in .env:
+#   local     COMPOSE_PROFILES=local-broker (the default in .env.example): the
+#             `solace` service runs here and the apps reach it as tcp://solace:55555.
+#   external  COMPOSE_PROFILES= (empty) and SOLACE_HOST/VPN/USERNAME/PASSWORD
+#             set to the external broker. Nothing broker-related starts here.
+#             For a broker on this machine, use tcp://host.docker.internal:55555.
+#
+#   docker compose up -d --build             issuer + the three subscribers (+ broker in local mode)
+#   docker compose run --rm publisher        publish 3 events as alice on thread t-1
+#   docker compose logs -f validator recipient profiler
+#   docker compose down
+#
+# Override SENDER_ID / THREAD_ID to try the topic filters, e.g.
+#   SENDER_ID=bob docker compose run --rm publisher     -> recipient sees it, profiler (alice) does not
+#   THREAD_ID=t-2 docker compose run --rm publisher     -> profiler sees it, recipient (t-1) does not
+#
+# The apps do not depends_on the broker (it may not be in this file's scope);
+# Broker.connect retries for up to three minutes instead, which also covers
+# the local container's 1-2 minute boot.
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: solace-obo-poc:dev
+  environment:
+    SOLACE_HOST: ${SOLACE_HOST:-tcp://solace:55555}
+    SOLACE_VPN: ${SOLACE_VPN:-default}
+    SOLACE_USERNAME: ${SOLACE_USERNAME:-default}
+    SOLACE_PASSWORD: ${SOLACE_PASSWORD:-default}
+    SOLACE_QUEUE_PREFIX: ${SOLACE_QUEUE_PREFIX:-q.poc}
+    SOLACE_CREATE_QUEUES: ${SOLACE_CREATE_QUEUES:-true}
+    OBO_ISSUER_URL: http://issuer:8000
+    OBO_ISSUER: ${OBO_ISSUER:-solace-obo-poc-issuer}
+    OBO_AUDIENCE: ${OBO_AUDIENCE:-poc}
+    OBO_TOKEN_TTL_SECONDS: ${OBO_TOKEN_TTL_SECONDS:-300}
+  extra_hosts:
+    - "host.docker.internal:host-gateway" # lets Linux hosts reach a broker on the host machine
+
+services:
+  # Local broker; only with the local-broker profile. PubSub+ Enterprise
+  # single node, pinned to the customer's release; the image must already be
+  # loaded locally (docker image ls solace-pubsub-enterprise). Spool state
+  # lives in the named volume below and survives `down`; `down -v` wipes it.
+  solace:
+    image: ${SOLACE_IMAGE:-solace-pubsub-enterprise:10.25.0.246}
+    container_name: solace-ent
+    profiles: ["local-broker"]
+    volumes:
+      - "solace-ent-storage-group:/var/lib/solace"
+    shm_size: 1g
+    ulimits:
+      core: -1
+      nofile:
+        soft: 2448
+        hard: 1048576
+    # With the exception of SMF, ports are mapped straight through from host
+    # to container, so a busy host port stops the container from starting.
+    # The issuer therefore publishes on host port 8001: 8000 is MQTT/WebSockets here.
+    ports:
+      - "8008:8008"   # Web transport
+      - "1443:1443"   # Web transport over TLS
+      - "1943:1943"   # SEMP over TLS
+      - "1883:1883"   # MQTT default VPN
+      - "5671:5671"   # AMQP default VPN over TLS
+      - "5672:5672"   # AMQP default VPN
+      - "8000:8000"   # MQTT default VPN over WebSockets
+      - "8443:8443"   # MQTT default VPN over WebSockets / TLS
+      - "8883:8883"   # MQTT default VPN over TLS
+      - "8080:8080"   # SEMP / PubSub+ Manager
+      - "9000:9000"   # REST default VPN
+      - "9443:9443"   # REST default VPN over TLS
+      - "55555:55555" # SMF (what the Python API connects to)
+      - "55003:55003" # SMF compressed
+      - "55443:55443" # SMF over TLS
+      - "2222:2222"   # SSH to the CLI
+    environment:
+      - username_admin_globalaccesslevel=admin
+      - username_admin_password=${SOLACE_ADMIN_PASSWORD:-admin}
+      - system_scaling_maxconnectioncount=100
+      - system_scaling_maxqueuemessagecount=240
+      - system_scaling_maxkafkabridgecount=0
+      - system_scaling_maxkafkabrokerconnectioncount=0
+      - system_scaling_maxbridgecount=25
+      - system_scaling_maxsubscriptioncount=500000
+      - system_scaling_maxguaranteedmessagesize=10
+      - messagespool_maxspoolusage=50000
+      - TZ=${TZ:-Asia/Singapore}
+    healthcheck:
+      # 200 once the message spool is active; the broker takes 1-2 minutes to boot.
+      test: ["CMD-SHELL", "curl -sf http://localhost:5550/health-check/guaranteed-active || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+  issuer:
+    <<: *app
+    container_name: solace-obo-poc-issuer
+    command: ["--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${ISSUER_PORT:-8001}:8000" # host port 8000 belongs to the broker's MQTT/WebSockets
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  validator:
+    <<: *app
+    container_name: solace-obo-poc-validator
+    entrypoint: ["obo-validator"]
+    command: []
+    depends_on:
+      issuer: { condition: service_healthy }
+    restart: on-failure
+
+  recipient:
+    <<: *app
+    container_name: solace-obo-poc-recipient
+    entrypoint: ["obo-recipient"]
+    command: ["--thread-id", "${THREAD_ID:-t-1}"]
+    depends_on:
+      issuer: { condition: service_healthy }
+    restart: on-failure
+
+  profiler:
+    <<: *app
+    container_name: solace-obo-poc-profiler
+    entrypoint: ["obo-profiler"]
+    command: ["--sender-id", "${SENDER_ID:-alice}"]
+    depends_on:
+      issuer: { condition: service_healthy }
+    restart: on-failure
+
+  # One-shot; only starts with `docker compose run --rm publisher`.
+  publisher:
+    <<: *app
+    entrypoint: ["obo-publisher"]
+    command:
+      - "--sender-id"
+      - "${SENDER_ID:-alice}"
+      - "--thread-id"
+      - "${THREAD_ID:-t-1}"
+      - "--count"
+      - "${COUNT:-3}"
+      - "--message"
+      - "${MESSAGE:-hello from poc in docker}"
+    profiles: ["publish"]
+    depends_on:
+      issuer: { condition: service_healthy }
+
+volumes:
+  solace-ent-storage-group:

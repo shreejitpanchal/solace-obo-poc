@@ -1,0 +1,26 @@
+# build / release output
+dist/
+build/
+*.spec
+
+# dev script logs and coverage artifacts
+scripts/logs/
+coverage_html/
+coverage.xml
+.coverage
+.coverage.*
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# machine-specific Claude Code settings
+.claude/settings.local.json
+
+# local secrets / keys
+.env
+*.pem

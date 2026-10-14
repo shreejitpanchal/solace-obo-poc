@@ -1,0 +1,5 @@
+# Normalise line endings in the repo; keep shell scripts LF on every checkout
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.ps1 text eol=crlf
