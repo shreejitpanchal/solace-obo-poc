@@ -1,11 +1,31 @@
-"""Topic layout for the POC and the single validation gate for topic levels.
+"""Topic and queue layout for the POC, plus the single validation gate for topic levels.
 
-    poc/msg/{sender-id}/{thread-id}            raw, published by the publisher
-    poc/msg-validate/{sender-id}/{thread-id}   republished by the validator
+Topics (two spaces, same shape)
+-------------------------------
+    poc/msg/{sender-id}/{thread-id}            RAW: published by the publisher,
+                                               consumed only by the validator
+    poc/msg-validate/{sender-id}/{thread-id}   VALIDATED: published by the validator,
+                                               consumed by the applications
 
-sender-id and thread-id come from the command line and from inbound topics, so
-they pass through `validate_level` before they are ever placed in a topic
-string: a `/`, `*` or `>` would otherwise rewrite the subscription structure.
+Putting sender-id and thread-id in the topic is what lets the broker route
+by either one with a wildcard subscription:
+
+    poc/msg-validate/*/t-1       every sender, thread t-1   (recipient)
+    poc/msg-validate/alice/*     sender alice, every thread (user-profiler)
+
+Queues (one per consumer instance)
+----------------------------------
+    <prefix>.validator                 subscription poc/msg/>
+    <prefix>.recipient.<thread-id>     subscription poc/msg-validate/*/<thread-id>
+    <prefix>.profiler.<sender-id>      subscription poc/msg-validate/<sender-id>/*
+
+Why validate_level() exists
+---------------------------
+sender-id and thread-id come from the command line and from inbound topics.
+They are spliced into topic strings and queue names, so they must never
+contain `/` (a new level), `*` or `>` (wildcards) or anything else that could
+change what a subscription matches. Every function here runs its inputs
+through validate_level() first.
 """
 
 from __future__ import annotations
@@ -16,6 +36,7 @@ from dataclasses import dataclass
 RAW_PREFIX = "poc/msg"
 VALIDATED_PREFIX = "poc/msg-validate"
 
+# Letters, digits, '.', '_' and '-', 1 to 64 characters. Nothing else.
 _LEVEL = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -30,6 +51,8 @@ def validate_level(value: str, name: str) -> str:
 
 @dataclass(frozen=True)
 class TopicParts:
+    """A parsed topic: which space it is in, and the two identifiers it carries."""
+
     prefix: str
     sender_id: str
     thread_id: str
@@ -43,7 +66,11 @@ class TopicParts:
         return self.prefix == VALIDATED_PREFIX
 
 
+# --- topic builders ----------------------------------------------------------
+
+
 def raw_topic(sender_id: str, thread_id: str) -> str:
+    """Where the publisher sends: poc/msg/<sender-id>/<thread-id>."""
     return (
         f"{RAW_PREFIX}/{validate_level(sender_id, 'sender-id')}"
         f"/{validate_level(thread_id, 'thread-id')}"
@@ -51,24 +78,28 @@ def raw_topic(sender_id: str, thread_id: str) -> str:
 
 
 def validated_topic(sender_id: str, thread_id: str) -> str:
+    """Where the validator republishes: poc/msg-validate/<sender-id>/<thread-id>."""
     return (
         f"{VALIDATED_PREFIX}/{validate_level(sender_id, 'sender-id')}"
         f"/{validate_level(thread_id, 'thread-id')}"
     )
 
 
+# --- subscriptions -----------------------------------------------------------
+
+
 def raw_subscription() -> str:
-    """Everything the publisher sends; what the validator listens to."""
+    """Everything the publisher sends; what the validator listens to. `>` = all remaining levels."""
     return f"{RAW_PREFIX}/>"
 
 
 def recipient_subscription(thread_id: str) -> str:
-    """Match by thread-id, any sender."""
+    """Match by thread-id, any sender: poc/msg-validate/*/<thread-id>."""
     return f"{VALIDATED_PREFIX}/*/{validate_level(thread_id, 'thread-id')}"
 
 
 def profiler_subscription(sender_id: str) -> str:
-    """Match by sender-id, any thread."""
+    """Match by sender-id, any thread: poc/msg-validate/<sender-id>/*."""
     return f"{VALIDATED_PREFIX}/{validate_level(sender_id, 'sender-id')}/*"
 
 
@@ -90,8 +121,15 @@ def profiler_queue(prefix: str, sender_id: str) -> str:
     return f"{prefix}.profiler.{validate_level(sender_id, 'sender-id')}"
 
 
+# --- parsing inbound topics --------------------------------------------------
+
+
 def parse_topic(topic: str) -> TopicParts:
-    """Split an inbound topic into its parts; ValueError if it is not one of ours."""
+    """Split an inbound topic into its parts; ValueError if it is not one of ours.
+
+    Used by the validator and by authz.authorize_event to learn which
+    sender-id an event claims, so the token's `sub` can be compared to it.
+    """
     for prefix in (VALIDATED_PREFIX, RAW_PREFIX):
         if topic.startswith(prefix + "/"):
             rest = topic[len(prefix) + 1 :].split("/")

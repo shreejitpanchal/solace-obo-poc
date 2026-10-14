@@ -1,12 +1,28 @@
-"""Thin wrapper over solace-pubsubplus: exactly what the POC needs, nothing else.
+"""Thin wrapper over the Solace Python API (solace-pubsubplus): what the POC needs, nothing else.
 
-Guaranteed messaging throughout: publishers wait for the broker's ack, and
-every consumer binds to its own durable queue that carries its topic
-subscription, so events are spooled while a consumer is down.
+Why a wrapper
+-------------
+The services and their tests talk to `Broker`, `Inbound` and `Outbound`, not
+to the SDK. That keeps the security logic (validator.py, authz.py,
+consumer.py) free of broker details and unit-testable without a broker. The
+SDK, which ships a native library, is imported inside the methods that need
+it, so importing this module never requires a broker or the native library.
 
-Services and their tests depend on `Inbound`/`Outbound` and a handler callable,
-not on the SDK. The SDK (and its native library) is imported inside the methods
-that talk to a real broker, so importing this module never needs a broker.
+Messaging model
+---------------
+Guaranteed (persistent) messaging throughout:
+  * publish() waits for the broker's acknowledgement, so a returned call means
+    the event is spooled on the broker;
+  * subscribe() binds a persistent receiver to a durable exclusive queue that
+    carries the topic subscription, so events are spooled while the consumer
+    is down and delivered when it rebinds;
+  * each message is acknowledged after the handler returns.
+
+Message shape used by the flow
+------------------------------
+    topic        poc/msg/<sender-id>/<thread-id>  or  poc/msg-validate/...
+    properties   user properties, e.g. "obo-token": <JWT>  (metadata)
+    payload      bytes, the application data (JSON in this POC)
 """
 
 from __future__ import annotations
@@ -21,28 +37,39 @@ from solace_obo_poc.config import BrokerConfig
 
 log = logging.getLogger(__name__)
 
+# How long publish() waits for the broker's ack before raising.
 PUBLISH_ACK_TIMEOUT_MS = 10_000
 
 
 @dataclass(frozen=True)
 class Inbound:
-    topic: str
+    """A received message, SDK-free: what handlers get."""
+
+    topic: str  # the exact topic the message was published to
     payload: bytes
-    properties: Mapping[str, str] = field(default_factory=dict)
+    properties: Mapping[str, str] = field(default_factory=dict)  # user properties
 
 
 @dataclass(frozen=True)
 class Outbound:
+    """A message to publish."""
+
     topic: str
     payload: bytes | str
     properties: Mapping[str, str] = field(default_factory=dict)
 
 
+# A handler receives one Inbound per message. It should return normally
+# (the message is then acked) and never raise for a bad message: log and drop.
 Handler = Callable[[Inbound], None]
 
 
 def to_inbound(message: Any) -> Inbound:
-    """Convert an SDK InboundMessage into the SDK-free shape handlers consume."""
+    """Convert an SDK InboundMessage into the SDK-free shape handlers consume.
+
+    get_properties() returns the user properties set by the publisher via
+    with_property(); that is where the OBO token lives.
+    """
     props = message.get_properties() or {}
     return Inbound(
         topic=message.get_destination_name(),
@@ -52,14 +79,17 @@ def to_inbound(message: Any) -> Inbound:
 
 
 class Broker:
+    """One connection to the broker, used for publishing and/or consuming."""
+
     def __init__(self, cfg: BrokerConfig) -> None:
         self._cfg = cfg
-        self._service: Any = None
-        self._publisher: Any = None
-        self._receivers: list[Any] = []
+        self._service: Any = None  # MessagingService once connected
+        self._publisher: Any = None  # PersistentMessagePublisher, created lazily
+        self._receivers: list[Any] = []  # PersistentMessageReceiver per subscribe()
         self._stop = threading.Event()
 
     def connect(self) -> Broker:
+        """Open the SMF connection using SOLACE_HOST / VPN / USERNAME / PASSWORD."""
         from solace.messaging.messaging_service import MessagingService, RetryStrategy
 
         props = {
@@ -68,8 +98,8 @@ class Broker:
             "solace.messaging.authentication.scheme.basic.username": self._cfg.username,
             "solace.messaging.authentication.scheme.basic.password": self._cfg.password,
         }
-        # Initial-connect retries cover a broker container that is still booting;
-        # reconnection retries cover a restart mid-run.
+        # Initial-connect retries (60 x 3 s) cover a broker container that is
+        # still booting; reconnection retries cover a broker restart mid-run.
         self._service = (
             MessagingService.builder()
             .from_properties(props)
@@ -78,11 +108,15 @@ class Broker:
             .build()
         )
         self._service.connect()
-        log.info("connected to broker %s", self._cfg.masked())
+        log.info("connected to broker %s", self._cfg.masked())  # password masked
         return self
 
     def publish(self, msg: Outbound) -> None:
-        """Persistent publish; returns once the broker has spooled the message."""
+        """Persistent publish; returns once the broker has spooled the message.
+
+        User properties are attached with with_property(); for the flow that
+        means {"obo-token": <JWT>}. The payload goes in as given.
+        """
         from solace.messaging.resources.topic import Topic
 
         if self._publisher is None:
@@ -98,10 +132,13 @@ class Broker:
     def subscribe(self, queue_name: str, subscriptions: list[str], handler: Handler) -> None:
         """Bind to a durable exclusive queue carrying `subscriptions`; deliver to `handler`.
 
-        With `create_queues` on (the default) a missing queue and its subscriptions
-        are created on start, which needs "allow guaranteed endpoint create" on
-        the client profile (on in the default profile). Off means the queue must
-        be pre-provisioned, and a missing one fails loudly here.
+        With `create_queues` on (the default, SOLACE_CREATE_QUEUES=true) a
+        missing queue and its subscriptions are created on start, which needs
+        "allow guaranteed endpoint create" on the client profile (on in the
+        default profile). Off means the queue must be pre-provisioned by an
+        administrator, and a missing one fails loudly here.
+
+        Delivery is asynchronous: the SDK calls the handler on its own thread.
         """
         from solace.messaging.config.missing_resources_creation_configuration import (
             MissingResourcesCreationStrategy,
@@ -123,6 +160,8 @@ class Broker:
         )
 
         class _Adapter(MessageHandler):
+            """SDK callback -> our Handler, with ack handling."""
+
             def on_message(self, message: Any) -> None:
                 # Handlers drop bad events deliberately and return normally. An
                 # exception here is a bug, not a transient fault, so the message
@@ -141,7 +180,7 @@ class Broker:
         log.info("consuming queue %s with subscriptions %s", queue_name, subscriptions)
 
     def wait(self) -> None:
-        """Block until Ctrl-C or `stop()`."""
+        """Block the main thread until Ctrl-C or `stop()`; messages arrive on SDK threads."""
         try:
             while not self._stop.wait(1.0):
                 pass
@@ -152,6 +191,7 @@ class Broker:
         self._stop.set()
 
     def close(self) -> None:
+        """Terminate receivers and publisher, then disconnect. Safe to call twice."""
         for receiver in self._receivers:
             receiver.terminate()
         self._receivers.clear()

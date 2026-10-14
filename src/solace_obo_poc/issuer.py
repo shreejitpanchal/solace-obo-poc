@@ -1,8 +1,27 @@
 """Mock OBO issuer: mints RS256 tokens and serves the JWKS the other hops verify with.
 
-Stands in for the customer's real issuer. The signing key is generated per
-process unless --key-file points at a PEM, so tokens from a previous run stop
-verifying after a restart; that is deliberate for a POC.
+Where it sits in the flow
+-------------------------
+    publisher --POST /token--> [issuer]            (step 1: get a token)
+    validator / recipient / profiler --GET /.well-known/jwks.json--> [issuer]
+                                                   (at start-up: get public keys)
+
+It stands in for the customer's real issuer. Nothing else in the flow changes
+as long as the real issuer produces a JWT with the same claims (see
+obo_token.py) and exposes a JWKS endpoint.
+
+Endpoints
+---------
+    POST /token                 {"sender_id": "alice", "actor": "poc-publisher"}
+                                -> {"access_token": "<JWT>", "token_type": "Bearer",
+                                    "expires_in": 300}
+    GET  /.well-known/jwks.json the public key(s), standard JWKS shape
+    GET  /healthz               liveness
+
+The signing key is generated per process unless --key-file points at a PEM,
+so tokens from a previous run stop verifying after a restart (they fail with
+"unknown kid"); that is deliberate for a POC and useful for demonstrating a
+rejection.
 """
 
 from __future__ import annotations
@@ -23,8 +42,8 @@ log = logging.getLogger(__name__)
 
 
 class TokenRequest(BaseModel):
-    sender_id: str
-    actor: str = "poc-publisher"
+    sender_id: str  # the user the token is issued on behalf of -> `sub`
+    actor: str = "poc-publisher"  # the service that will present it -> `act.sub`
 
 
 class TokenResponse(BaseModel):
@@ -34,6 +53,7 @@ class TokenResponse(BaseModel):
 
 
 def create_app(keypair: KeyPair, cfg: TokenConfig) -> FastAPI:
+    """Build the FastAPI app around one signing key and the configured iss/aud/ttl."""
     app = FastAPI(title="OBO issuer (POC)")
 
     @app.get("/healthz")
@@ -42,15 +62,20 @@ def create_app(keypair: KeyPair, cfg: TokenConfig) -> FastAPI:
 
     @app.get("/.well-known/jwks.json")
     def jwks() -> dict:
+        # Public half only. Verifiers fetch this once at start-up.
         return keypair.jwks()
 
     @app.post("/token", response_model=TokenResponse)
     def token(req: TokenRequest) -> TokenResponse:
+        # sender_id ends up in a topic level downstream and actor in a claim,
+        # so both go through the same validation gate as everywhere else.
         try:
             validate_level(req.sender_id, "sender_id")
             validate_level(req.actor, "actor")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # A real issuer would authenticate the caller and check that `actor`
+        # is allowed to act for `sender_id` here. The mock trusts the request.
         access_token = keypair.issue(
             issuer=cfg.issuer,
             audience=cfg.audience,
@@ -65,6 +90,7 @@ def create_app(keypair: KeyPair, cfg: TokenConfig) -> FastAPI:
 
 
 def load_keypair(key_file: Path | None) -> KeyPair:
+    """Per-process key by default; a PEM file when tokens must survive restarts."""
     if key_file is None:
         return KeyPair.generate()
     try:
@@ -74,13 +100,14 @@ def load_keypair(key_file: Path | None) -> KeyPair:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Process entry point (`obo-issuer`). Serves until Ctrl-C."""
     parser = argparse.ArgumentParser(description="Mock OBO token issuer")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--key-file", type=Path, default=None, help="RSA private key PEM")
     args = parser.parse_args(argv)
     configure_logging()
-    cfg = token_config()
+    cfg = token_config()  # OBO_ISSUER, OBO_AUDIENCE, OBO_TOKEN_TTL_SECONDS
     try:
         keypair = load_keypair(args.key_file)
     except TokenError as exc:
