@@ -471,6 +471,10 @@ automatically, and host runs can use `uv run --env-file .env obo-<service>`.
 
 ## 9. Develop and release
 
+The code itself is documented in [docs/DEVELOPER.md](docs/DEVELOPER.md):
+module map, a function-level trace of one event, tests, how to extend the
+POC (real issuer, new consumers, pre-provisioned queues), and debugging.
+
 `scripts/dev.sh` and `scripts/dev.ps1` own every build command; CI only calls
 task names. Logs land in `scripts/logs/<task>.log`.
 
