@@ -125,9 +125,16 @@ class Broker:
         builder = self._service.message_builder()
         for key, value in msg.properties.items():
             builder = builder.with_property(key, value)
+        log.debug(
+            "publishing to %s: %d bytes, properties=%s, waiting for broker ack",
+            msg.topic,
+            len(msg.payload),
+            sorted(msg.properties),
+        )
         self._publisher.publish_await_acknowledgement(
             builder.build(msg.payload), Topic.of(msg.topic), PUBLISH_ACK_TIMEOUT_MS
         )
+        log.debug("broker acknowledged %s (spooled to every matching queue)", msg.topic)
 
     def subscribe(self, queue_name: str, subscriptions: list[str], handler: Handler) -> None:
         """Bind to a durable exclusive queue carrying `subscriptions`; deliver to `handler`.
@@ -167,12 +174,15 @@ class Broker:
                 # exception here is a bug, not a transient fault, so the message
                 # is still acked: redelivering a poison message forever helps
                 # nobody in a POC. Swap for settle(FAILED) if redelivery is wanted.
+                inbound = to_inbound(message)
+                log.debug("queue %s delivered a message on %s", queue_name, inbound.topic)
                 try:
-                    handler(to_inbound(message))
+                    handler(inbound)
                 except Exception:
                     log.exception("handler failed; message dropped")
                 finally:
                     receiver.ack(message)
+                    log.debug("acked message on %s from queue %s", inbound.topic, queue_name)
 
         receiver.start()
         receiver.receive_async(_Adapter())

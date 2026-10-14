@@ -1,5 +1,6 @@
-# Whole POC in containers: issuer, validator, recipient, user-profiler, a
-# one-shot publisher, and optionally the broker itself.
+# Whole POC in containers: issuer, publisher (one event every
+# PUBLISH_INTERVAL_SECONDS), validator, recipient, user-profiler, and
+# optionally the broker itself.
 #
 # Broker, two modes, chosen in .env:
 #   local     COMPOSE_PROFILES=local-broker (the default in .env.example): the
@@ -8,14 +9,14 @@
 #             set to the external broker. Nothing broker-related starts here.
 #             For a broker on this machine, use tcp://host.docker.internal:55555.
 #
-#   docker compose up -d --build             issuer + the three subscribers (+ broker in local mode)
-#   docker compose run --rm publisher        publish 3 events as alice on thread t-1
-#   docker compose logs -f validator recipient profiler
+#   docker compose up -d --build             everything (+ broker in local mode); the publisher
+#                                            then emits one event every PUBLISH_INTERVAL_SECONDS
+#   docker compose logs -f publisher validator recipient profiler
 #   docker compose down
 #
-# Override SENDER_ID / THREAD_ID to try the topic filters, e.g.
-#   SENDER_ID=bob docker compose run --rm publisher     -> recipient sees it, profiler (alice) does not
-#   THREAD_ID=t-2 docker compose run --rm publisher     -> profiler sees it, recipient (t-1) does not
+# One-off bursts with other ids, alongside the running publisher:
+#   SENDER_ID=bob PUBLISH_COUNT=3 docker compose run --rm publisher   -> recipient sees it, profiler (alice) does not
+#   THREAD_ID=t-2 PUBLISH_COUNT=3 docker compose run --rm publisher   -> profiler sees it, recipient (t-1) does not
 #
 # The apps do not depends_on the broker (it may not be in this file's scope);
 # Broker.connect retries for up to three minutes instead, which also covers
@@ -37,6 +38,9 @@ x-app: &app
     OBO_ISSUER: ${OBO_ISSUER:-solace-obo-poc-issuer}
     OBO_AUDIENCE: ${OBO_AUDIENCE:-poc}
     OBO_TOKEN_TTL_SECONDS: ${OBO_TOKEN_TTL_SECONDS:-300}
+    PUBLISH_INTERVAL_SECONDS: ${PUBLISH_INTERVAL_SECONDS:-5}
+    PUBLISH_COUNT: ${PUBLISH_COUNT:-0}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
   extra_hosts:
     - "host.docker.internal:host-gateway" # lets Linux hosts reach a broker on the host machine
 
@@ -136,22 +140,23 @@ services:
       issuer: { condition: service_healthy }
     restart: on-failure
 
-  # One-shot; only starts with `docker compose run --rm publisher`.
+  # Runs continuously: one event every PUBLISH_INTERVAL_SECONDS as SENDER_ID
+  # in THREAD_ID, refreshing its OBO token before expiry. PUBLISH_COUNT > 0
+  # publishes that many and exits (useful with `docker compose run`).
   publisher:
     <<: *app
+    container_name: solace-obo-poc-publisher
     entrypoint: ["obo-publisher"]
     command:
       - "--sender-id"
       - "${SENDER_ID:-alice}"
       - "--thread-id"
       - "${THREAD_ID:-t-1}"
-      - "--count"
-      - "${COUNT:-3}"
       - "--message"
       - "${MESSAGE:-hello from poc in docker}"
-    profiles: ["publish"]
     depends_on:
       issuer: { condition: service_healthy }
+    restart: on-failure
 
 volumes:
   solace-ent-storage-group:

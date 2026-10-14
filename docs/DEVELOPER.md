@@ -48,8 +48,8 @@ Python 3.12, managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates
 | `authz.py` | `authorize_event`: parse topic, verify token, bind `sub` to sender-id, then decode payload. | topics, obo_token |
 | `broker.py` | Wrapper over the Solace Python API. `Broker.publish` (persistent, waits for ack), `Broker.subscribe` (durable queue + topic subscription + ack). `Inbound`/`Outbound` are the SDK-free message shapes. | solace-pubsubplus (imported lazily) |
 | `issuer.py` | FastAPI app: `POST /token`, `GET /.well-known/jwks.json`, `GET /healthz`. Entry point `obo-issuer`. | fastapi, uvicorn, obo_token |
-| `publisher.py` | `fetch_token`, `build_message`, entry point `obo-publisher`. | broker, obo_token, topics |
-| `validator.py` | `validate_message` (pure decision), `make_handler`, entry point `obo-validator`. | broker, obo_token, topics |
+| `publisher.py` | `fetch_token` (returns `IssuedToken` with expiry), `build_message`, and the timed publish loop with token refresh; entry point `obo-publisher`. | broker, obo_token, topics |
+| `validator.py` | `forward_message` (pure mapping raw topic -> validated topic, token untouched), `make_handler`, entry point `obo-validator`. | broker, topics |
 | `consumer.py` | Shared loop for the two applications: `make_handler` (authorize then `on_event`), `run`. | authz, broker, obo_token |
 | `recipient.py` | Entry point `obo-recipient --thread-id T`; supplies queue, subscription and `on_event`. | consumer, topics |
 | `profiler.py` | Entry point `obo-profiler --sender-id A`; same shape as recipient. | consumer, topics |
@@ -70,23 +70,24 @@ Function-level trace of one event, matching the five steps in the README.
 ```
 publisher.main
   ├─ topics.validate_level(sender_id / thread_id / actor)      reject unsafe ids first
+  ├─ config.publisher_config    PUBLISH_INTERVAL_SECONDS / PUBLISH_COUNT (flags override)
   ├─ publisher.fetch_token      POST OBO_ISSUER_URL/token  ──►  issuer: KeyPair.issue
-  ├─ publisher.build_message    Outbound(topic=topics.raw_topic(...),
-  │                                      properties={"obo-token": jwt},
-  │                                      payload=json)
-  └─ broker.Broker.publish      persistent publish, waits for ack
+  └─ loop (every interval, until Ctrl-C or count reached)
+        ├─ IssuedToken.needs_refresh → publisher.fetch_token   30 s before expiry
+        ├─ publisher.build_message    Outbound(topic=topics.raw_topic(...),
+        │                                      properties={"obo-token": jwt},
+        │                                      payload=json)
+        └─ broker.Broker.publish      persistent publish, waits for ack
 
 validator.main
-  ├─ obo_token.JwksVerifier.from_url   GET OBO_ISSUER_URL/.well-known/jwks.json  (once)
   └─ broker.Broker.subscribe(q.poc.validator, ["poc/msg/>"], handler)
         └─ validator.make_handler → handle(Inbound)
-              ├─ validator.validate_message
+              ├─ validator.forward_message
               │     ├─ topics.parse_topic             sender-id, thread-id from the topic
-              │     ├─ JwksVerifier.verify(props["obo-token"])
-              │     ├─ claims.subject == parts.sender_id   (else TokenError)
               │     └─ Outbound(topic=topics.validated_topic(...), payload unchanged,
-              │                 properties + "obo-validated-at")
+              │                 properties unchanged + "obo-forwarded-at")
               └─ broker.Broker.publish              or log.warning("dropped ...") and return
+                 (the token is NOT inspected here; see authz below)
 
 recipient.main / profiler.main
   ├─ topics.validate_level(thread_id | sender_id)
@@ -153,8 +154,8 @@ Formatting and linting are ruff, configured in `pyproject.toml` (line length
 | `test_obo_token.py` | issue/verify round trip; expired, wrong `aud`, wrong `iss`, tampered signature, unknown `kid`, garbage; JWKS shape; `from_url`; PEM loading |
 | `test_authz.py` | the gate order: decoder never called on missing/invalid/mismatched token |
 | `test_issuer.py` | endpoints via FastAPI `TestClient`; 400 on unsafe ids |
-| `test_publisher.py` | `build_message` shape, `fetch_token` via `httpx.MockTransport`, `main` with a fake broker |
-| `test_validator.py` | `validate_message` accept/reject paths, handler drops and never logs a full token, `main` wiring |
+| `test_publisher.py` | `build_message` shape, `fetch_token` and expiry via `httpx.MockTransport`, the publish loop (count, interval, env defaults, token refresh, Ctrl-C) with a fake broker |
+| `test_validator.py` | `forward_message` forwards regardless of token, refuses foreign/validated topics, never logs a full token, `main` wiring |
 | `test_consumer.py` | handler delivers only authorized events, `run` wiring, recipient/profiler queue and subscription names |
 | `test_config.py` | defaults apply only when unset, password masking, boolean parsing |
 | `test_broker.py` | `to_inbound`; plus two opt-in live-broker tests |
@@ -194,10 +195,13 @@ only when a variable is unset, so exported values and `.env` always win.
 | `SOLACE_USERNAME` / `SOLACE_PASSWORD` | `default` / `default` | every broker client |
 | `SOLACE_QUEUE_PREFIX` | `q.poc` | validator, recipient, profiler |
 | `SOLACE_CREATE_QUEUES` | `true` | validator, recipient, profiler |
-| `OBO_ISSUER_URL` | `http://127.0.0.1:8000` | publisher, validator, recipient, profiler |
+| `OBO_ISSUER_URL` | `http://127.0.0.1:8000` | publisher, recipient, profiler |
 | `OBO_ISSUER` | `solace-obo-poc-issuer` | issuer (writes `iss`), verifiers (expect it) |
 | `OBO_AUDIENCE` | `poc` | issuer (writes `aud`), verifiers (expect it) |
 | `OBO_TOKEN_TTL_SECONDS` | `300` | issuer |
+| `PUBLISH_INTERVAL_SECONDS` | `5` | publisher (`--interval` overrides) |
+| `PUBLISH_COUNT` | `0` | publisher (`--count` overrides; 0 = until stopped) |
+| `LOG_LEVEL` | `INFO` | every service (`DEBUG` for per-step detail) |
 
 A bad value fails at start-up with a `ConfigError` naming the variable and
 the fix. Add a new setting by extending the dataclass and the reader in
@@ -255,8 +259,8 @@ application's `on_event`. Nothing else cares.
 - **"connection refused" at start.** Expected while the broker container
   boots; `Broker.connect` retries for up to three minutes.
 - **"token signed with unknown kid".** The issuer restarted and has a new key
-  while the verifiers still hold the old JWKS. Restart validator, recipient
-  and profiler, or run the issuer with `--key-file` for a stable key.
+  while the verifiers still hold the old JWKS. Restart recipient and
+  profiler, or run the issuer with `--key-file` for a stable key.
 - **"cannot fetch JWKS" / "cannot obtain OBO token".** `OBO_ISSUER_URL` does
   not reach the issuer. Inside compose it is `http://issuer:8000`; from the
   host the container is on port 8001.
@@ -264,7 +268,7 @@ application's `on_event`. Nothing else cares.
   (Queues): does it exist, does it carry the expected subscription, is the
   consumer bound, are messages spooled? A `sender-id`/`thread-id` typo shows
   up here as a subscription that matches nothing.
-- **Message dropped by the validator with "does not match sender-id".** The
+- **Event refused by an application with "does not match sender-id".** The
   token's `sub` differs from the topic's sender-id: the publisher asked for a
   token for one user and published under another.
 - **Exclusive queue "already bound".** Two instances with the same filter

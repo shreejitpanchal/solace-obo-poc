@@ -24,6 +24,7 @@ Tokens are credentials. mask_token() is the only form that may be logged.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,6 +35,8 @@ import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
+
+log = logging.getLogger(__name__)
 
 # Name of the Solace message user property that carries the token.
 TOKEN_PROPERTY = "obo-token"
@@ -81,7 +84,12 @@ class KeyPair:
         and tokens signed by the old one fail with "unknown kid" downstream
         until the verifiers refetch the JWKS (in the POC: restart them)."""
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        return cls(key, kid or uuid.uuid4().hex)
+        kid = kid or uuid.uuid4().hex
+        log.info(
+            "generated new RSA-2048 signing key kid=%s (tokens from older keys will not verify)",
+            kid,
+        )
+        return cls(key, kid)
 
     @classmethod
     def from_pem(cls, pem: bytes, kid: str) -> KeyPair:
@@ -126,15 +134,28 @@ class KeyPair:
         }
         # The kid goes into the JWT header so verifiers can pick the matching
         # JWKS entry before checking the signature.
-        return jwt.encode(claims, self._private_key, algorithm=ALGORITHM, headers={"kid": self.kid})
+        token = jwt.encode(
+            claims, self._private_key, algorithm=ALGORITHM, headers={"kid": self.kid}
+        )
+        log.info(
+            "issued token %s: sub=%s act=%s aud=%s jti=%s ttl=%ds kid=%s",
+            mask_token(token),
+            subject,
+            actor,
+            audience,
+            claims["jti"],
+            ttl_seconds,
+            self.kid,
+        )
+        return token
 
 
 class JwksVerifier:
     """Verifies tokens against a JWKS document; one instance per issuer.
 
-    Used by the validator, the recipient and the user-profiler. Verification
-    is entirely local: after the JWKS has been fetched once, no network call
-    is made per message.
+    Used by the recipient and the user-profiler (the validator only forwards
+    and never verifies). Verification is entirely local: after the JWKS has
+    been fetched once, no network call is made per message.
     """
 
     def __init__(self, jwks: dict[str, Any], *, issuer: str, audience: str) -> None:
@@ -144,12 +165,21 @@ class JwksVerifier:
             raise TokenError(f"issuer JWKS is unusable: {exc}") from exc
         self._issuer = issuer  # expected `iss`
         self._audience = audience  # expected `aud`
+        kids = [k.get("kid") for k in jwks.get("keys", [])]
+        log.info(
+            "verifier ready: %d public key(s) kids=%s; will require iss=%r aud=%r",
+            len(kids),
+            kids,
+            issuer,
+            audience,
+        )
 
     @classmethod
     def from_url(
         cls, url: str, *, issuer: str, audience: str, client: httpx.Client | None = None
     ) -> JwksVerifier:
         """Fetch the JWKS from the issuer (GET /.well-known/jwks.json) and build a verifier."""
+        log.info("fetching issuer public keys from %s", url)
         try:
             response = (client or httpx).get(url, timeout=10.0)
             response.raise_for_status()
@@ -171,21 +201,31 @@ class JwksVerifier:
           4. aud and iss match what this deployment expects
           5. exp has not passed (and iat/sub/jti are present)
         Note what is NOT checked here: that `sub` matches the topic. That is
-        the caller's job (validator.validate_message / authz.authorize_event),
+        the caller's job (authz.authorize_event),
         because only the caller knows the topic.
         """
         if not token:
             raise TokenError(f"no OBO token: message property {TOKEN_PROPERTY!r} is missing")
+        masked = mask_token(token)
         try:
             # Read the header without trusting it yet: we only need the kid
             # to select the key. Everything else waits for jwt.decode().
             kid = jwt.get_unverified_header(token).get("kid")
             if not kid:
                 raise TokenError("token header has no kid")
+            log.debug("token %s: header kid=%s, selecting public key", masked, kid)
             try:
                 key = self._keys[kid].key
             except KeyError:
                 raise TokenError(f"token signed with unknown kid {kid!r}") from None
+            log.debug(
+                "token %s: checking signature (%s), iss=%r, aud=%r, expiry, required claims %s",
+                masked,
+                ALGORITHM,
+                self._issuer,
+                self._audience,
+                _REQUIRED_CLAIMS,
+            )
             # jwt.decode() verifies signature, audience, issuer, expiry and
             # the required claims in one call, raising a specific PyJWTError
             # for each failure (ExpiredSignatureError, InvalidAudienceError, ...).
@@ -198,12 +238,21 @@ class JwksVerifier:
                 options={"require": _REQUIRED_CLAIMS},
             )
         except jwt.PyJWTError as exc:
-            raise TokenError(f"OBO token {mask_token(token)} rejected: {exc}") from exc
+            raise TokenError(f"OBO token {masked} rejected: {exc}") from exc
         actor = (payload.get("act") or {}).get("sub", "")
-        return OboClaims(
+        claims = OboClaims(
             subject=payload["sub"],
             actor=actor,
             token_id=payload["jti"],
             issued_at=datetime.fromtimestamp(payload["iat"], tz=UTC),
             expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC),
         )
+        log.info(
+            "token %s verified: sub=%s act=%s jti=%s expires=%s",
+            masked,
+            claims.subject,
+            claims.actor,
+            claims.token_id,
+            claims.expires_at.isoformat(timespec="seconds"),
+        )
+        return claims

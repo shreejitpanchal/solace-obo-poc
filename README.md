@@ -1,9 +1,9 @@
 # Solace OBO Python POC
 
 A proof of concept showing how an **on-behalf-of (OBO) token** travels with an
-event through Solace PubSub+, is checked by an intermediate validator service,
-and is checked again by every consuming application before it reads the
-event. The security decision is made per message, from the token carried in
+event through Solace PubSub+, is forwarded by an intermediate validator
+service into a validated topic space, and is verified by every consuming
+application before it reads the event. The security decision is made per message, from the token carried in
 the message itself, and not from the identity of the connection that delivered it.
 
 Contents
@@ -43,7 +43,7 @@ The POC puts five pieces together:
 | **Issuer** | The customer's token issuer. In the POC it is a small mock service that signs tokens and publishes its public keys. |
 | **Publisher** | The application that creates events for a user. |
 | **Solace PubSub+ broker** | The event mesh that routes and spools the events. |
-| **Validator** | A service in the middle that admits only events carrying a valid token into the "validated" topic space. |
+| **Validator** | A service in the middle that moves events from the raw topic space into the "validated" topic space the applications subscribe to, carrying the token along untouched. |
 | **Recipient** and **User-Profiler** | The consuming applications, each filtering the validated events differently and each re-checking the token itself. |
 
 ```
@@ -55,7 +55,7 @@ The POC puts five pieces together:
  ┌───────┴───────┐  2. publish                 ┌──────┴─────┐         │
  │   Publisher   │  poc/msg/{sender}/{thread}│            │         │
  │  application  ├─────────────► Solace ───────►│ Validator  │         │
- └───────────────┘   obo-token in properties    │ 3. verify  │         │
+ └───────────────┘   obo-token in properties    │ 3. forward │         │
                                                 └──────┬─────┘         │
                                    4. republish        │               │
                        poc/msg-validate/{sender}/{thread}           │
@@ -102,7 +102,8 @@ every later hop relies on:
 | `kid` (header) | key id | Which issuer key signed it, so verifiers pick the right public key. |
 
 The issuer publishes its public keys at `/.well-known/jwks.json`. The private
-key never leaves the issuer; the publisher, validator and consumers only ever
+key never leaves the issuer; the validator carries the token without reading
+it, and the consuming applications only ever
 hold public keys.
 
 > In production the mock issuer is replaced by the customer's real issuer.
@@ -141,47 +142,45 @@ is: **nobody opens the payload until the property has been verified.**
 
 The publisher sends the message as a persistent (guaranteed) message and
 waits for the broker's acknowledgement, so once `publish` returns the event
-is safely spooled on the broker.
+is safely spooled on the broker. It then waits `PUBLISH_INTERVAL_SECONDS`
+(default 5) and repeats, until stopped or until `PUBLISH_COUNT` events have
+been sent. Because a run can outlive the token's 300-second lifetime, the
+publisher asks the issuer for a fresh token 30 seconds before the current one
+expires, so every event leaves with a token that will still verify downstream.
 
 Identifiers that end up in a topic (`sender-id`, `thread-id`) are validated
 before use: only letters, digits, `.`, `_` and `-`, at most 64 characters.
 This stops a crafted id such as `alice/>` from rewriting the topic structure.
 
-### Step 3: the validator checks the token and admits the event
+### Step 3: the validator forwards the event into the validated topic space
 
 The validator consumes from its own queue, `q.poc.validator`, which
 subscribes to `poc/msg/>` (everything the publisher sends). For each
 message it:
 
 1. **Parses the topic** and extracts `sender-id` and `thread-id` from it.
-2. **Extracts the token** from the `obo-token` message property. A message
-   without that property is rejected immediately.
-3. **Verifies the token** against the issuer's JWKS, which it fetched at
-   start-up:
-   - the signature is valid for the key named by `kid` (an unknown `kid` is a rejection),
-   - `iss` and `aud` are the expected values,
-   - the token has not expired,
-   - `sub`, `jti`, `iat` and `exp` are all present.
-4. **Binds the token to the topic**: the token's `sub` must equal the
-   `sender-id` in the topic. A valid token for `alice` on a topic claiming
-   `bob` is rejected. This is what prevents one user's token from being
-   reused to speak for another user.
-5. **Republishes** the event, payload byte-for-byte unchanged, to the
-   validated topic `poc/msg-validate/alice/t-1`. The `obo-token` property
-   is carried along, and a second property `obo-validated-at` records when
-   the validator admitted it.
+2. **Republishes** the event, payload byte-for-byte unchanged and every
+   message property carried along, to the validated topic
+   `poc/msg-validate/alice/t-1`. A property `obo-forwarded-at` records when
+   it was forwarded.
 
-A message that fails any check is **not** republished. It is acknowledged on
-the validator's queue (so it does not loop), and a warning is logged with the
-reason and a masked token prefix (never the full token). The validator never
-opens the payload.
+The validator does **not** inspect or verify the `obo-token` property. The
+token passes through it as opaque metadata, and the authorization decision is
+made by each consuming application in step 5. The validator therefore has no
+connection to the issuer and holds no keys; its job is to move events from
+the raw topic space, which only it subscribes to, into the validated topic
+space that the applications subscribe to.
+
+The only messages it refuses are ones it cannot forward: a topic outside
+`poc/msg/` (including its own output, which guards against a loop) or a
+malformed `sender-id`/`thread-id`. Those are acknowledged and logged with a
+masked token prefix. The validator never opens the payload.
 
 Example log lines:
 
 ```
-validated poc/msg/alice/t-1 -> poc/msg-validate/alice/t-1
-dropped poc/msg/bob/t-1 (token eyJhbGci...): token subject 'alice' does not match sender-id 'bob'
-dropped poc/msg/alice/t-1 (token <none>): no OBO token: message property 'obo-token' is missing
+forwarded poc/msg/alice/t-1 -> poc/msg-validate/alice/t-1 (token eyJhbGci...)
+dropped other/topic (token eyJhbGci...): topic 'other/topic' is outside poc/msg/ and poc/msg-validate/
 ```
 
 ### Step 4: the broker fans the validated event out by topic
@@ -202,12 +201,19 @@ lands only in the profiler's queue. Because the queues are durable, events
 published while a consumer is down wait on the broker and are delivered when
 it reconnects.
 
-### Step 5: each consumer verifies again, then reads the payload
+### Step 5: each consumer verifies the token, then reads the payload
 
-The Recipient and the User-Profiler do **not** trust the validator hop. Each
-one repeats the verification from step 3 with its own copy of the issuer's
-public keys: token present, signature, `iss`, `aud`, expiry, and `sub` equal
-to the `sender-id` in the topic. Only when all of that passes does the
+This is where the OBO token is checked. The Recipient and the User-Profiler
+each verify it with their own copy of the issuer's public keys (JWKS,
+fetched once at start-up):
+
+- the `obo-token` property is present,
+- the signature is valid for the key named by `kid` (an unknown `kid` is a rejection),
+- `iss` and `aud` are the expected values,
+- the token has not expired, and `sub`, `jti`, `iat`, `exp` are present,
+- the token's `sub` equals the `sender-id` in the topic, so a valid token
+  for `alice` on a topic claiming `bob` is rejected. This prevents one user's
+  token from being reused to speak for another user. Only when all of that passes does the
 application decode the JSON payload and hand it to its business logic.
 
 The order is enforced in code: the payload decoder is not even called until
@@ -221,12 +227,12 @@ recipient received: sender=alice thread=t-1 sub=alice act=poc-publisher payload=
 user-profiler profiling: sender=alice thread=t-1 sub=alice act=poc-publisher payload={...}
 ```
 
-Why verify twice? The validator keeps unverified traffic out of the validated
-topic space, which protects every consumer at once and gives one place to
-audit. The consumer's own check means that a misconfigured or compromised
-hop, or an application that subscribes to the raw topics by mistake, still
-cannot read an event without a valid token for its sender. Each application
-is responsible for its own authorization decision.
+Why at the consumer and not at the validator? The application is the party
+that acts on the event, so it owns the authorization decision: it does not
+have to trust any hop in between, and a misconfigured intermediate cannot
+grant access it should not. Verification is offline and cheap (a signature
+check against a cached public key), so doing it at the point of use costs
+nothing. The validator stays a plain forwarder that never needs keys.
 
 ---
 
@@ -291,10 +297,10 @@ PubSub+ Manager (Queues) when a thread-id or sender-id is no longer needed.
 | Command | Role |
 |---|---|
 | `obo-issuer` | Mock issuer. Mints tokens (`POST /token`) and serves `/.well-known/jwks.json`. |
-| `obo-publisher --sender-id A --thread-id T` | Publisher. Fetches a token for A, publishes events with it in the `obo-token` property. |
-| `obo-validator` | Consumes `q.poc.validator`, verifies the token and that `sub` matches the sender-id, republishes to the validated topic. |
-| `obo-recipient --thread-id T` | Consumes `q.poc.recipient.T`, re-verifies, then reads the payload. |
-| `obo-profiler --sender-id A` | Consumes `q.poc.profiler.A`, re-verifies, then reads the payload. |
+| `obo-publisher --sender-id A --thread-id T` | Publisher. Fetches a token for A and publishes one event every `PUBLISH_INTERVAL_SECONDS` (default 5) with it in the `obo-token` property, refreshing the token before it expires. `--count N` publishes N and exits. |
+| `obo-validator` | Consumes `q.poc.validator`, republishes each event unchanged to the validated topic. Does not inspect the token. |
+| `obo-recipient --thread-id T` | Consumes `q.poc.recipient.T`, verifies the token, then reads the payload. |
+| `obo-profiler --sender-id A` | Consumes `q.poc.profiler.A`, verifies the token, then reads the payload. |
 
 All five are entry points of one Python package (`src/solace_obo_poc/`),
 built on the Solace Python API (`solace-pubsubplus`) and PyJWT.
@@ -381,52 +387,60 @@ queues are pre-provisioned, guaranteed endpoint create (see section 4).
 
 ### Walk through the flow (both options)
 
-Watch the three services in one terminal and publish from another:
+Once the stack is up the publisher emits one event every 5 seconds as `alice`
+in thread `t-1`. Watch all four services together:
 
 ```sh
-docker compose logs -f validator recipient profiler       # terminal 1
-docker compose run --rm publisher                         # terminal 2: 3 events as alice on thread t-1
+docker compose logs -f publisher validator recipient profiler
 ```
 
-Expected: the validator logs `validated poc/msg/alice/t-1 -> poc/msg-validate/alice/t-1`
-three times, and both the recipient and the profiler log the three payloads
-(steps 3 to 5 above). In PubSub+ Manager, Queues shows the three queues with
-their subscriptions.
+Expected, repeating every 5 seconds with an increasing `seq`:
 
-**Guaranteed delivery.** Stop the recipient, publish, start it again, and
-watch it receive the events that arrived while it was down:
+- publisher: `published seq=N to poc/msg/alice/t-1 (token eyJhbGci...)`
+- validator: `forwarded poc/msg/alice/t-1 -> poc/msg-validate/alice/t-1 (token eyJhbGci..., not inspected)`
+- recipient and profiler: `token eyJhbGci... verified: sub=alice ...`, then
+  `authorized poc/msg-validate/alice/t-1 ...`, then the application line with
+  the message text (steps 3 to 5 above).
+
+Every 270 seconds the publisher logs that it is refreshing its token, and the
+`kid`/`jti` in the consumers' lines change accordingly. In PubSub+ Manager,
+Queues shows the three queues with their subscriptions.
+
+**Guaranteed delivery.** Stop the recipient for a while, then start it again
+and watch it receive every event that arrived while it was down:
 
 ```sh
-docker compose stop recipient
-docker compose run --rm publisher
+docker compose stop recipient            # publisher keeps publishing
+sleep 20
 docker compose start recipient && docker compose logs -f recipient
 ```
 
-**Topic filtering.** Change the sender or the thread and see which
-application receives the event:
+**Topic filtering.** Run a one-off burst with a different sender or thread
+alongside the continuous publisher and see which application receives it:
 
 ```sh
-SENDER_ID=bob docker compose run --rm publisher    # recipient sees it (thread t-1), profiler (alice) does not
-THREAD_ID=t-2 docker compose run --rm publisher    # profiler sees it (sender alice), recipient (t-1) does not
+SENDER_ID=bob PUBLISH_COUNT=3 docker compose run --rm publisher    # recipient sees it (thread t-1), profiler (alice) does not
+THREAD_ID=t-2 PUBLISH_COUNT=3 docker compose run --rm publisher    # profiler sees it (sender alice), recipient (t-1) does not
 ```
 
-`SENDER_ID`, `THREAD_ID`, `COUNT` and `MESSAGE` override the publisher's
-arguments; `SENDER_ID` and `THREAD_ID` also set the profiler and recipient
-filters at `up` time, so change them in `.env` and `up` again to re-filter.
+`SENDER_ID`, `THREAD_ID` and `MESSAGE` set the publisher's arguments;
+`PUBLISH_INTERVAL_SECONDS` and `PUBLISH_COUNT` its cadence; and `SENDER_ID`
+and `THREAD_ID` also set the profiler and recipient filters at `up` time.
+Change them in `.env` and `up` again to re-filter. (On PowerShell, set them
+in `.env` rather than as a command prefix.)
 
 **A rejected token.** The issuer generates a new signing key every time it
-starts, while the validator and the consumers keep the public keys they
-fetched at their own start. Restart only the issuer and publish again: the
-new token is signed by a key the validator does not know, so it is dropped
-with `dropped poc/msg/alice/t-1 (token eyJhbGci...): token signed with unknown kid`
-and nothing reaches the applications. Restart the three services to pick up
-the new keys and the flow recovers.
+starts, while the consumers keep the public keys they fetched at their own
+start. Restart the issuer together with the publisher so the publisher
+fetches a token signed by the new key: the validator forwards the events as
+always, but each application refuses them with
+`refusing event on poc/msg-validate/alice/t-1: ... token signed with unknown kid`
+and never reads the payload. Restart the two applications to pick up the new
+keys and the flow recovers.
 
 ```sh
-docker compose restart issuer
-docker compose run --rm publisher                          # validator drops all 3
-docker compose restart validator recipient profiler
-docker compose run --rm publisher                          # flows again
+docker compose restart issuer publisher                    # recipient and profiler now refuse every event
+docker compose restart recipient profiler                  # flows again
 ```
 
 ```sh
@@ -443,7 +457,7 @@ uv run obo-issuer                                     # terminal 1
 uv run obo-validator                                  # terminal 2
 uv run obo-recipient --thread-id t-1                  # terminal 3
 uv run obo-profiler --sender-id alice                 # terminal 4
-uv run obo-publisher --sender-id alice --thread-id t-1 --count 3
+uv run obo-publisher --sender-id alice --thread-id t-1          # one event every 5 s; add --count 3 for a burst
 docker compose down
 ```
 
@@ -466,6 +480,9 @@ automatically, and host runs can use `uv run --env-file .env obo-<service>`.
 | `OBO_ISSUER` | `solace-obo-poc-issuer` | Expected `iss` claim |
 | `OBO_AUDIENCE` | `poc` | Expected `aud` claim |
 | `OBO_TOKEN_TTL_SECONDS` | `300` | Token lifetime the issuer grants |
+| `PUBLISH_INTERVAL_SECONDS` | `5` | Seconds between the publisher's events (decimal allowed) |
+| `PUBLISH_COUNT` | `0` | Events to publish before exiting; `0` runs until stopped |
+| `LOG_LEVEL` | `INFO` | `DEBUG` logs every token check and broker call; tokens stay masked |
 
 ---
 

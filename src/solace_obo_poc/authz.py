@@ -19,12 +19,15 @@ the decoder function is not even called. Tests assert exactly that.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from solace_obo_poc.obo_token import TOKEN_PROPERTY, JwksVerifier, OboClaims, TokenError
 from solace_obo_poc.topics import TopicParts, parse_topic
+
+log = logging.getLogger(__name__)
 
 
 class AuthorizationError(Exception):
@@ -64,10 +67,17 @@ def authorize_event(
         parts = parse_topic(topic)
     except ValueError as exc:
         raise AuthorizationError(f"refusing event: {exc}") from exc
+    log.debug(
+        "authz step 1/4 topic ok: sender-id=%s thread-id=%s (%s space)",
+        parts.sender_id,
+        parts.thread_id,
+        "validated" if parts.is_validated else "raw",
+    )
 
     # 2. Token. The verifier holds the issuer's public keys; verify() checks
     #    signature, issuer, audience, expiry and required claims, and raises
     #    TokenError (with the reason) if the property is missing or bad.
+    log.debug("authz step 2/4 verifying %r property", TOKEN_PROPERTY)
     try:
         claims = verifier.verify(properties.get(TOKEN_PROPERTY))
     except TokenError as exc:
@@ -81,10 +91,12 @@ def authorize_event(
             f"refusing event on {topic}: token subject {claims.subject!r} does not match "
             f"sender-id {parts.sender_id!r} in the topic"
         )
+    log.debug("authz step 3/4 binding ok: token sub=%s == topic sender-id", claims.subject)
 
     # 4. Payload. Only now is the business data touched.
     try:
         payload = decode(raw_payload)
     except ValueError as exc:
         raise PayloadError(f"event on {topic} authorized but payload is not JSON: {exc}") from exc
+    log.debug("authz step 4/4 payload decoded (%d bytes)", len(raw_payload))
     return AuthorizedEvent(topic=parts, claims=claims, payload=payload)

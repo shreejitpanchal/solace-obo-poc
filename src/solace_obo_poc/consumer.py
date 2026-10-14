@@ -53,6 +53,15 @@ def make_handler(name: str, verifier: JwksVerifier, on_event: OnEvent) -> Handle
     """
 
     def handle(msg: Inbound) -> None:
+        token = mask_token(msg.properties.get(TOKEN_PROPERTY))
+        log.info(
+            "%s: received %s (%d bytes, properties=%s, token %s); authorizing before read",
+            name,
+            msg.topic,
+            len(msg.payload),
+            sorted(msg.properties),
+            token,
+        )
         try:
             # The whole security decision happens inside authorize_event().
             # If it returns, the token was valid for this sender and the
@@ -61,14 +70,22 @@ def make_handler(name: str, verifier: JwksVerifier, on_event: OnEvent) -> Handle
         except AuthorizationError as exc:
             # Bad or missing token, or token/topic mismatch. Log a masked
             # prefix only: tokens are credentials and never go to logs whole.
-            token = mask_token(msg.properties.get(TOKEN_PROPERTY))
-            log.warning("%s: %s (token %s)", name, exc, token)
+            log.warning("%s: %s (token %s); payload NOT read", name, exc, token)
             return
         except PayloadError as exc:
             # Token was fine but the payload is not JSON: a publisher bug,
             # not a security event. Still dropped, still logged.
             log.warning("%s: %s", name, exc)
             return
+        log.info(
+            "%s: authorized %s: token sub=%s matches sender-id, act=%s, expires=%s; "
+            "handing payload to the application",
+            name,
+            msg.topic,
+            event.claims.subject,
+            event.claims.actor,
+            event.claims.expires_at.isoformat(timespec="seconds"),
+        )
         on_event(event)
 
     return handle
@@ -94,15 +111,14 @@ def run(name: str, queue_name: QueueName, subscription: str, on_event: OnEvent) 
     #    topic subscription) is created on first start when the broker allows
     #    it; afterwards it also spools events while the application is down.
     broker_cfg = broker_config()
+    queue = queue_name(broker_cfg.queue_prefix)
+    log.info("%s starting: queue=%s subscription=%s", name, queue, subscription)
     broker = Broker(broker_cfg).connect()
     try:
-        broker.subscribe(
-            queue_name(broker_cfg.queue_prefix),
-            [subscription],
-            make_handler(name, verifier, on_event),
-        )
+        broker.subscribe(queue, [subscription], make_handler(name, verifier, on_event))
         # 3. Messages now arrive on the broker's callback thread; the main
         #    thread just waits for Ctrl-C.
+        log.info("%s ready; waiting for events (Ctrl-C to stop)", name)
         broker.wait()
     finally:
         broker.close()

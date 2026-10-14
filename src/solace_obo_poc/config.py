@@ -98,8 +98,56 @@ def token_config(env: Mapping[str, str] | None = None) -> TokenConfig:
     )
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+@dataclass(frozen=True)
+class PublisherConfig:
+    interval_seconds: float  # pause between events; 0 publishes as fast as the broker acks
+    count: int  # events to publish before exiting; 0 means until stopped
+
+
+def publisher_config(env: Mapping[str, str] | None = None) -> PublisherConfig:
+    """PUBLISH_INTERVAL_SECONDS (default 5) and PUBLISH_COUNT (default 0 = run until Ctrl-C)."""
+    env = os.environ if env is None else env
+    raw_interval = env.get("PUBLISH_INTERVAL_SECONDS", "5")
+    try:
+        interval = float(raw_interval)
+    except ValueError as exc:
+        raise ConfigError(
+            f"PUBLISH_INTERVAL_SECONDS must be a number of seconds, got {raw_interval!r}; "
+            "unset it for the default of 5"
+        ) from exc
+    if interval < 0:
+        raise ConfigError(f"PUBLISH_INTERVAL_SECONDS must not be negative, got {interval}")
+    raw_count = env.get("PUBLISH_COUNT", "0")
+    try:
+        count = int(raw_count)
+    except ValueError as exc:
+        raise ConfigError(
+            f"PUBLISH_COUNT must be an integer (0 = until stopped), got {raw_count!r}"
+        ) from exc
+    if count < 0:
+        raise ConfigError(f"PUBLISH_COUNT must not be negative, got {count}")
+    return PublisherConfig(interval_seconds=interval, count=count)
+
+
+def configure_logging(level: int | None = None, env: Mapping[str, str] | None = None) -> None:
+    """Root logger to stderr. LOG_LEVEL=DEBUG shows every step (token checks, broker I/O).
+
+    INFO (the default) logs each activity once: token obtained, message
+    received, token verified, event forwarded or delivered, event refused.
+    DEBUG adds the detail behind each of those lines.
+    """
+    env = os.environ if env is None else env
+    if level is None:
+        name = env.get("LOG_LEVEL", "INFO").strip().upper()
+        if name not in logging.getLevelNamesMapping():
+            raise ConfigError(
+                f"LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR; got {name!r}"
+            )
+        level = logging.getLevelNamesMapping()[name]
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    # The Solace SDK logs a lot at INFO; keep it to warnings unless DEBUG is asked for.
+    sdk_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    logging.getLogger("solace").setLevel(sdk_level)

@@ -41,7 +41,19 @@ def on_event(event: AuthorizedEvent) -> None:
     issued for and which service presented it, `event.topic` has the parsed
     sender-id / thread-id. A real recipient would deliver the message here.
     """
-    log.info("%s received: %s", NAME, consumer.describe(event))
+    # By the time we are here the token has been verified and the payload decoded.
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    log.info(
+        "%s received message seq=%s in thread %s from %s: %r (on behalf of %s, presented by %s)",
+        NAME,
+        payload.get("seq", "?"),
+        event.topic.thread_id,
+        event.topic.sender_id,
+        payload.get("text", event.payload),
+        event.claims.subject,
+        event.claims.actor,
+    )
+    log.debug("%s full event: %s", NAME, consumer.describe(event))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
         validate_level(args.thread_id, "--thread-id")
     except ValueError as exc:
         parser.error(str(exc))
+
+    log.info(
+        "%s following thread %s: will receive every sender's messages in it",
+        NAME,
+        args.thread_id,
+    )
 
     # consumer.run() fetches the issuer keys, binds the queue with the
     # subscription, and calls on_event for every event that passes the gate.

@@ -39,7 +39,19 @@ def on_event(event: AuthorizedEvent) -> None:
     A real profiler would update the user's profile from `event.payload` here,
     knowing from `event.claims` that the event really is on behalf of that user.
     """
-    log.info("%s profiling: %s", NAME, consumer.describe(event))
+    # By the time we are here the token has been verified and the payload decoded.
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    log.info(
+        "%s profiling %s: message seq=%s in thread %s: %r (on behalf of %s, presented by %s)",
+        NAME,
+        event.topic.sender_id,
+        payload.get("seq", "?"),
+        event.topic.thread_id,
+        payload.get("text", event.payload),
+        event.claims.subject,
+        event.claims.actor,
+    )
+    log.debug("%s full event: %s", NAME, consumer.describe(event))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,6 +67,12 @@ def main(argv: list[str] | None = None) -> int:
         validate_level(args.sender_id, "--sender-id")
     except ValueError as exc:
         parser.error(str(exc))
+
+    log.info(
+        "%s following user %s: will receive that user's messages in every thread",
+        NAME,
+        args.sender_id,
+    )
 
     # consumer.run() fetches the issuer keys, binds the queue with the
     # subscription, and calls on_event for every event that passes the gate.

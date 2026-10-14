@@ -1,6 +1,6 @@
 import pytest
 
-from solace_obo_poc.config import ConfigError, broker_config, token_config
+from solace_obo_poc.config import ConfigError, broker_config, publisher_config, token_config
 
 
 def test_broker_defaults_apply_only_when_unset():
@@ -59,3 +59,27 @@ def test_token_config_strips_trailing_slash():
 def test_token_ttl_errors_name_the_variable(bad):
     with pytest.raises(ConfigError, match="OBO_TOKEN_TTL_SECONDS"):
         token_config({"OBO_TOKEN_TTL_SECONDS": bad})
+
+
+def test_publisher_defaults_every_5_seconds_until_stopped():
+    cfg = publisher_config({})
+    assert cfg.interval_seconds == 5.0
+    assert cfg.count == 0
+
+
+def test_publisher_overrides():
+    cfg = publisher_config({"PUBLISH_INTERVAL_SECONDS": "0.5", "PUBLISH_COUNT": "10"})
+    assert cfg.interval_seconds == 0.5
+    assert cfg.count == 10
+
+
+@pytest.mark.parametrize("bad", ["soon", "-1"])
+def test_publisher_interval_errors_name_the_variable(bad):
+    with pytest.raises(ConfigError, match="PUBLISH_INTERVAL_SECONDS"):
+        publisher_config({"PUBLISH_INTERVAL_SECONDS": bad})
+
+
+@pytest.mark.parametrize("bad", ["many", "-3", "1.5"])
+def test_publisher_count_errors_name_the_variable(bad):
+    with pytest.raises(ConfigError, match="PUBLISH_COUNT"):
+        publisher_config({"PUBLISH_COUNT": bad})
