@@ -85,7 +85,7 @@ $TArch = if ($env:TARGET_ARCH) { $env:TARGET_ARCH } else { Get-HostArch }
 
 # One binary per service in the POC; names carry the target so the release
 # job's merge-multiple never collides.
-$Components = @('issuer', 'publisher', 'validator', 'recipient', 'profiler')
+$Components = @('issuer', 'publisher', 'validator', 'recipient', 'profiler', 'news_consumer')
 
 # --- tasks ------------------------------------------------------------------
 # PowerShell returns EVERY uncaptured pipeline value, not just `return`: route
@@ -100,10 +100,12 @@ function Task-build {
   New-Item -ItemType Directory -Force -Path $Dist, $BuildDir | Out-Null
   $c = Invoke-Uv 'build' @('sync'); if ($c -ne 0) { return $c }
   foreach ($comp in $Components) {
-    # --name gets .exe appended automatically on Windows.
+    # --name gets .exe appended automatically on Windows. Module underscores
+    # become dashes so the binary matches its console script (obo-news-consumer).
     $entry = Join-Path $RepoRoot "src\solace_obo_poc\$comp.py"
+    $binName = $comp -replace '_', '-'
     $c = Invoke-Uv 'build' @('run', 'pyinstaller', '--noconfirm', '--clean', '--onefile', '--log-level', 'WARN',
-      '--name', "obo-$comp-$TOs-$TArch",
+      '--name', "obo-$binName-$TOs-$TArch",
       '--distpath', $Dist, '--workpath', $BuildDir, '--specpath', $BuildDir,
       '--paths', (Join-Path $RepoRoot 'src'), '--collect-all', 'solace', $entry)
     if ($c -ne 0) { return $c }

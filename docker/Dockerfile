@@ -1,4 +1,5 @@
-# One image for all five services; compose picks the entry point per service.
+# One image for every service (issuer, publisher, validator, recipient,
+# profiler, news consumer); compose picks the entry point per service.
 #
 # Lives under docker/ rather than the repo root on purpose: tag.yml and the dev
 # scripts auto-detect a root Dockerfile as "this project ships an image". This

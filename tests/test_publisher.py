@@ -27,6 +27,17 @@ def test_build_message_rejects_unsafe_ids(issue):
         build_message(issue(), "a/b", "t", "x", 1)
 
 
+def test_build_message_kind_news_uses_the_news_topic_space(issue):
+    msg = build_message(issue("alice"), "alice", "t-1", "headline", 1, kind="news")
+    assert msg.topic == "poc/news/alice/t-1"
+    assert json.loads(msg.payload)["text"] == "headline"
+
+
+def test_build_message_rejects_unknown_kind(issue):
+    with pytest.raises(ValueError, match="kind"):
+        build_message(issue(), "alice", "t-1", "x", 1, kind="alerts")
+
+
 def test_fetch_token_posts_sender_and_actor_and_records_expiry(token_cfg):
     seen = {}
 
@@ -135,6 +146,23 @@ def test_main_publishes_count_messages_then_exits(monkeypatch, fake_broker):
     assert [m.topic for m in fake_broker[:2]] == ["poc/msg/alice/t-1"] * 2
     assert [json.loads(m.payload)["seq"] for m in fake_broker[:2]] == [1, 2]
     assert fake_broker[-1] == "closed"
+
+
+def test_main_kind_news_publishes_to_the_news_topic(monkeypatch, fake_broker):
+    monkeypatch.setattr("solace_obo_poc.publisher.fetch_token", fresh)
+    argv = ["--kind", "news", "--sender-id", "alice", "--thread-id", "t-1", "--count", "1"]
+    assert main(argv + ["--interval", "0"]) == 0
+    assert fake_broker[0].topic == "poc/news/alice/t-1"
+
+
+def test_main_rejects_unknown_kind_before_any_network(monkeypatch, fake_broker):
+    monkeypatch.setattr(
+        "solace_obo_poc.publisher.fetch_token", lambda *a, **k: pytest.fail("issuer touched")
+    )
+    with pytest.raises(SystemExit) as exc:
+        main(["--kind", "alerts", "--sender-id", "alice", "--thread-id", "t-1"])
+    assert exc.value.code == 2
+    assert fake_broker == []
 
 
 def test_env_count_and_interval_are_used_when_flags_absent(monkeypatch, fake_broker):

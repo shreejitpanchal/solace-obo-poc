@@ -70,7 +70,7 @@ T_ARCH="${TARGET_ARCH:-$(host_arch)}"
 
 # One binary per service in the POC; names carry the target so the release
 # job's merge-multiple never collides.
-COMPONENTS="issuer publisher validator recipient profiler"
+COMPONENTS="issuer publisher validator recipient profiler news_consumer"
 
 # --- tasks ------------------------------------------------------------------
 task_build() {
@@ -84,9 +84,10 @@ task_build() {
   run build $UV sync || return $?
   local comp
   for comp in $COMPONENTS; do
-    # --name gets .exe appended automatically on Windows.
+    # --name gets .exe appended automatically on Windows. Module underscores
+    # become dashes so the binary matches its console script (obo-news-consumer).
     run build $UV run pyinstaller --noconfirm --clean --onefile --log-level WARN \
-      --name "obo-$comp-$T_OS-$T_ARCH" \
+      --name "obo-${comp//_/-}-$T_OS-$T_ARCH" \
       --distpath "$DIST" --workpath "$BUILD_DIR" --specpath "$BUILD_DIR" \
       --paths "$REPO_ROOT/src" --collect-all solace \
       "$REPO_ROOT/src/solace_obo_poc/$comp.py" || return $?

@@ -19,6 +19,7 @@ obo-publisher = "solace_obo_poc.publisher:main"
 obo-validator = "solace_obo_poc.validator:main"
 obo-recipient = "solace_obo_poc.recipient:main"
 obo-profiler = "solace_obo_poc.profiler:main"
+obo-news-consumer = "solace_obo_poc.news_consumer:main"
 
 [dependency-groups]
 dev = [

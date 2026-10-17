@@ -47,7 +47,7 @@ from solace_obo_poc.config import (
     token_config,
 )
 from solace_obo_poc.obo_token import TOKEN_PROPERTY, TokenError, mask_token
-from solace_obo_poc.topics import raw_topic, validate_level
+from solace_obo_poc.topics import KINDS, raw_topic, validate_level
 
 log = logging.getLogger(__name__)
 
@@ -105,8 +105,13 @@ def fetch_token(
     return issued
 
 
-def build_message(token: str, sender_id: str, thread_id: str, text: str, seq: int) -> Outbound:
-    """Assemble one event: token in the user properties, event data in the payload."""
+def build_message(
+    token: str, sender_id: str, thread_id: str, text: str, seq: int, kind: str = "msg"
+) -> Outbound:
+    """Assemble one event: token in the user properties, event data in the payload.
+
+    `kind` selects the raw topic space: "msg" (poc/msg/...) or "news" (poc/news/...).
+    """
     # The payload is whatever the business application wants to send. These
     # fields are illustrative; nothing downstream depends on them except that
     # the payload is JSON.
@@ -118,7 +123,7 @@ def build_message(token: str, sender_id: str, thread_id: str, text: str, seq: in
         "sent_at": datetime.now(UTC).isoformat(),
     }
     return Outbound(
-        topic=raw_topic(sender_id, thread_id),  # poc/msg/<sender-id>/<thread-id>
+        topic=raw_topic(sender_id, thread_id, kind),  # poc/<kind>/<sender-id>/<thread-id>
         payload=json.dumps(payload),
         properties={TOKEN_PROPERTY: token},  # "obo-token": the JWT, as metadata
     )
@@ -129,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Publisher")
     parser.add_argument("--sender-id", required=True, help="user the events are sent on behalf of")
     parser.add_argument("--thread-id", required=True, help="conversation the events belong to")
+    parser.add_argument(
+        "--kind",
+        choices=KINDS,
+        default="msg",
+        help="event kind: msg publishes to poc/msg/..., news to poc/news/... (default: msg)",
+    )
     parser.add_argument("--message", default="hello from poc")
     parser.add_argument(
         "--count",
@@ -176,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info(
         "publishing to %s every %.1fs as sub=%s (%s); Ctrl-C to stop",
-        raw_topic(args.sender_id, args.thread_id),
+        raw_topic(args.sender_id, args.thread_id, args.kind),
         interval,
         args.sender_id,
         f"{count} events" if count else "until stopped",
@@ -198,7 +209,9 @@ def main(argv: list[str] | None = None) -> int:
                 except TokenError as exc:
                     log.error("%s", exc)
                     return 2
-            msg = build_message(issued.token, args.sender_id, args.thread_id, args.message, seq)
+            msg = build_message(
+                issued.token, args.sender_id, args.thread_id, args.message, seq, args.kind
+            )
             broker.publish(msg)
             log.info("published seq=%d to %s (token %s)", seq, msg.topic, mask_token(issued.token))
             if count and seq >= count:

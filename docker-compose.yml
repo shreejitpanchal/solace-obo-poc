@@ -1,5 +1,6 @@
 # Whole POC in containers: issuer, publisher (one event every
-# PUBLISH_INTERVAL_SECONDS), validator, recipient, user-profiler, and
+# PUBLISH_INTERVAL_SECONDS), news publisher (same cadence, kind news),
+# validator, recipient, user-profiler, the six news consumers, and
 # optionally the broker itself.
 #
 # Broker, two modes, chosen in .env:
@@ -12,6 +13,7 @@
 #   docker compose up -d --build             everything (+ broker in local mode); the publisher
 #                                            then emits one event every PUBLISH_INTERVAL_SECONDS
 #   docker compose logs -f publisher validator recipient profiler
+#   docker compose logs -f news-publisher validator news-kai-zen   (the news flow; any news-* service)
 #   docker compose down
 #
 # One-off bursts with other ids, alongside the running publisher:
@@ -43,6 +45,15 @@ x-app: &app
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
   extra_hosts:
     - "host.docker.internal:host-gateway" # lets Linux hosts reach a broker on the host machine
+
+# One of the six news consumers. Each service below sets only its --app; the
+# app binds q.poc.news.<app> with subscription poc/news-validate/> on start.
+x-news-consumer: &news-consumer
+  <<: *app
+  entrypoint: ["obo-news-consumer"]
+  depends_on:
+    issuer: { condition: service_healthy }
+  restart: on-failure
 
 services:
   # Local broker; only with the local-broker profile. PubSub+ Enterprise
@@ -157,6 +168,58 @@ services:
     depends_on:
       issuer: { condition: service_healthy }
     restart: on-failure
+
+  # Same publisher, kind news: one news event every PUBLISH_INTERVAL_SECONDS
+  # to poc/news/SENDER_ID/THREAD_ID. The validator forwards it to
+  # poc/news-validate/..., where only the six news consumers listen; the
+  # recipient and profiler never see it.
+  news-publisher:
+    <<: *app
+    container_name: solace-obo-poc-news-publisher
+    entrypoint: ["obo-publisher"]
+    command:
+      - "--kind"
+      - "news"
+      - "--sender-id"
+      - "${SENDER_ID:-alice}"
+      - "--thread-id"
+      - "${THREAD_ID:-t-1}"
+      - "--message"
+      - "${NEWS_MESSAGE:-breaking news from poc in docker}"
+    depends_on:
+      issuer: { condition: service_healthy }
+    restart: on-failure
+
+  # The six news consumers, one container and one queue each.
+  news-kai-go-mobile:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-go-mobile
+    command: ["--app", "Kai-Go-Mobile"]
+
+  news-kai-go-desktop:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-go-desktop
+    command: ["--app", "Kai-Go-Desktop"]
+
+  news-kai-signals-engine:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-signals-engine
+    command: ["--app", "Kai-Signals-Engine"]
+
+  news-kai-storefront:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-storefront
+    command: ["--app", "Kai-StoreFront"]
+
+  news-kai-cowork:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-cowork
+    command: ["--app", "Kai-Cowork"]
+
+  news-kai-zen:
+    <<: *news-consumer
+    container_name: solace-obo-poc-news-kai-zen
+    command: ["--app", "Kai-Zen"]
 
 volumes:
   solace-ent-storage-group:

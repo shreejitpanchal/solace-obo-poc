@@ -61,8 +61,8 @@ def authorize_event(
     rejected event. Production code uses json.loads.
     """
     # 1. Topic. parse_topic validates both levels and rejects anything outside
-    #    poc/msg/ and poc/msg-validate/, so a stray message from an unrelated
-    #    topic is refused before we look at any token.
+    #    the POC spaces (poc/msg*, poc/news*), so a stray message from an
+    #    unrelated topic is refused before we look at any token.
     try:
         parts = parse_topic(topic)
     except ValueError as exc:

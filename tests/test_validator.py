@@ -34,10 +34,19 @@ def test_forwarder_does_not_inspect_the_payload():
     assert out.payload == b"not json at all"
 
 
-def test_already_validated_topic_is_not_forwarded_again():
+def test_news_event_is_forwarded_to_the_news_validated_topic(issue):
+    token = issue("alice")
+    out = forward_message(Inbound("poc/news/alice/t-1", b'{"h":1}', {TOKEN_PROPERTY: token}))
+    assert out.topic == "poc/news-validate/alice/t-1"
+    assert out.payload == b'{"h":1}'
+    assert out.properties[TOKEN_PROPERTY] == token
+
+
+@pytest.mark.parametrize("topic", ["poc/msg-validate/alice/t-1", "poc/news-validate/alice/t-1"])
+def test_already_validated_topic_is_not_forwarded_again(topic):
     """Guards against a loop if the subscription is ever widened."""
     with pytest.raises(ValueError, match="raw topics"):
-        forward_message(Inbound("poc/msg-validate/alice/t-1", b"{}", {}))
+        forward_message(Inbound(topic, b"{}", {}))
 
 
 @pytest.mark.parametrize("topic", ["other/topic", "poc/msg/alice", "poc/msg/a*b/t-1"])
@@ -66,7 +75,7 @@ def test_handler_log_never_contains_the_token(issue, caplog):
     assert token[:8] in caplog.text
 
 
-def test_main_subscribes_to_raw_topics_and_closes(monkeypatch):
+def test_main_subscribes_to_every_raw_space_and_closes(monkeypatch):
     calls = []
 
     class FakeBroker:
@@ -91,4 +100,8 @@ def test_main_subscribes_to_raw_topics_and_closes(monkeypatch):
     monkeypatch.setattr("solace_obo_poc.validator.Broker", FakeBroker)
     monkeypatch.setenv("SOLACE_QUEUE_PREFIX", "q.test")
     assert main([]) == 0
-    assert calls == [("subscribe", "q.test.validator", ["poc/msg/>"]), ("wait",), ("close",)]
+    assert calls == [
+        ("subscribe", "q.test.validator", ["poc/msg/>", "poc/news/>"]),
+        ("wait",),
+        ("close",),
+    ]

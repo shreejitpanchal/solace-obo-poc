@@ -36,7 +36,7 @@ must be sure that the event was really published **on behalf of** the user it
 claims to come from. That proof is the OBO token: a signed token issued by a
 trusted issuer that says "service X is acting on behalf of user Y, until time T".
 
-The POC puts five pieces together:
+The POC puts these pieces together:
 
 | Piece | Stands for |
 |---|---|
@@ -44,7 +44,8 @@ The POC puts five pieces together:
 | **Publisher** | The application that creates events for a user. |
 | **Solace PubSub+ broker** | The event mesh that routes and spools the events. |
 | **Validator** | A service in the middle that moves events from the raw topic space into the "validated" topic space the applications subscribe to, carrying the token along untouched. |
-| **Recipient** and **User-Profiler** | The consuming applications, each filtering the validated events differently and each re-checking the token itself. |
+| **Recipient** and **User-Profiler** | The consuming applications for messages, each filtering the validated events differently and each re-checking the token itself. |
+| **Six news consumers** | Kai-Go-Mobile, Kai-Go-Desktop, Kai-Signals-Engine, Kai-StoreFront, Kai-Cowork and Kai-Zen: each receives every validated news event on its own queue and re-checks the token the same way (section 4). |
 
 ```
                           ┌──────────┐
@@ -68,6 +69,22 @@ The POC puts five pieces together:
                           │  5. verify,  │              │  5. verify,    │
                           │     then read│              │     then read  │
                           └──────────────┘              └────────────────┘
+```
+
+News follows the same five steps in its own topic spaces, with six consumers
+instead of two:
+
+```
+ ┌───────────────┐  2. publish --kind news        ┌────────────┐
+ │   Publisher   │  poc/news/{sender}/{thread}    │ Validator  │  4. republish
+ │  application  ├─────────────► Solace ─────────►│ 3. forward ├──► poc/news-validate/{sender}/{thread}
+ └───────────────┘   obo-token in properties      └────────────┘               │
+                                                                               │
+          ┌──────────────┬──────────────┬─────── Solace ──────┬──────────────┬─┴────────────┐
+          │              │              │                     │              │              │
+   q.poc.news.     q.poc.news.    q.poc.news.          q.poc.news.    q.poc.news.    q.poc.news.
+   Kai-Go-Mobile   Kai-Go-Desktop Kai-Signals-Engine   Kai-StoreFront Kai-Cowork     Kai-Zen
+   (poc/news-validate/>  on every queue; each application 5. verifies the token, then reads)
 ```
 
 ---
@@ -155,8 +172,8 @@ This stops a crafted id such as `alice/>` from rewriting the topic structure.
 ### Step 3: the validator forwards the event into the validated topic space
 
 The validator consumes from its own queue, `q.poc.validator`, which
-subscribes to `poc/msg/>` (everything the publisher sends). For each
-message it:
+subscribes to `poc/msg/>` and `poc/news/>` (everything either publisher
+sends). For each message it:
 
 1. **Parses the topic** and extracts `sender-id` and `thread-id` from it.
 2. **Republishes** the event, payload byte-for-byte unchanged and every
@@ -194,12 +211,22 @@ broker:
 |---|---|---|---|
 | Recipient for thread `t-1` | every message in that thread | `q.poc.recipient.t-1` | `poc/msg-validate/*/t-1` |
 | User-Profiler for user `alice` | every message alice sent | `q.poc.profiler.alice` | `poc/msg-validate/alice/*` |
+| News consumer `Kai-Zen` (one of six) | every news event | `q.poc.news.Kai-Zen` | `poc/news-validate/>` |
 
 So an event from `alice` in `t-1` lands in both queues; an event from `bob`
 in `t-1` lands only in the recipient's queue; an event from `alice` in `t-2`
 lands only in the profiler's queue. Because the queues are durable, events
 published while a consumer is down wait on the broker and are delivered when
 it reconnects.
+
+News is a second kind of event with its own topic spaces (`poc/news/...`
+raw, `poc/news-validate/...` validated). The same validator forwards it. Six
+applications consume news (Kai-Go-Mobile, Kai-Go-Desktop, Kai-Signals-Engine,
+Kai-StoreFront, Kai-Cowork, Kai-Zen); each has its own queue carrying the
+same `poc/news-validate/>` subscription, so one news event is spooled into
+six queues and every application receives its own copy. The recipient and
+the profiler never see news, because their subscriptions are in the
+`poc/msg-validate` space.
 
 ### Step 5: each consumer verifies the token, then reads the payload
 
@@ -251,6 +278,10 @@ nothing. The validator stays a plain forwarder that never needs keys.
   and logged with the reason and a masked token. Tokens are never logged in full.
 - **Topic design does the routing.** Thread-based and sender-based consumers
   are just two subscriptions on the same validated topic space.
+- **One event, many independent consumers.** The six news applications each
+  own a queue with the same `poc/news-validate/>` subscription, so the broker
+  spools one news event into six queues and each application consumes,
+  verifies and acks at its own pace.
 - **Delivery is guaranteed.** Persistent publishing and durable queues mean a
   restarting consumer loses nothing.
 
@@ -268,6 +299,8 @@ Things the POC deliberately leaves out, which a production rollout adds:
 ```
 poc/msg/{sender-id}/{thread-id}            raw: published by the publisher, consumed only by the validator
 poc/msg-validate/{sender-id}/{thread-id}   validated: published by the validator, consumed by applications
+poc/news/{sender-id}/{thread-id}           raw news: `obo-publisher --kind news`, consumed only by the validator
+poc/news-validate/{sender-id}/{thread-id}  validated news: published by the validator, consumed by the six news consumers
 ```
 
 Messaging is guaranteed end to end: the publisher and the validator wait for
@@ -277,9 +310,15 @@ handling it, including events it drops for a bad token.
 
 | Queue | Owner | Topic subscription |
 |---|---|---|
-| `q.poc.validator` | validator | `poc/msg/>` |
+| `q.poc.validator` | validator | `poc/msg/>` and `poc/news/>` |
 | `q.poc.recipient.<thread-id>` | recipient for that thread | `poc/msg-validate/*/<thread-id>` |
 | `q.poc.profiler.<sender-id>` | user-profiler for that sender | `poc/msg-validate/<sender-id>/*` |
+| `q.poc.news.Kai-Go-Mobile` | news consumer Kai-Go-Mobile | `poc/news-validate/>` |
+| `q.poc.news.Kai-Go-Desktop` | news consumer Kai-Go-Desktop | `poc/news-validate/>` |
+| `q.poc.news.Kai-Signals-Engine` | news consumer Kai-Signals-Engine | `poc/news-validate/>` |
+| `q.poc.news.Kai-StoreFront` | news consumer Kai-StoreFront | `poc/news-validate/>` |
+| `q.poc.news.Kai-Cowork` | news consumer Kai-Cowork | `poc/news-validate/>` |
+| `q.poc.news.Kai-Zen` | news consumer Kai-Zen | `poc/news-validate/>` |
 
 By default (`SOLACE_CREATE_QUEUES=true`) a consumer creates its queue and
 subscription on start if they are missing, which the broker allows when the
@@ -289,6 +328,67 @@ profile does. On a broker where an administrator provisions queues, set
 instead of being created. `SOLACE_QUEUE_PREFIX` changes the `q.poc` prefix.
 Queues are durable and persist after the consumer disconnects; delete them in
 PubSub+ Manager (Queues) when a thread-id or sender-id is no longer needed.
+
+### How a queue's topic subscription drives delivery
+
+Nothing in the POC sends a message *to* a queue. Publishers only publish to
+a topic, and consumers only bind to a queue. The link between the two is the
+topic subscription attached to each queue, which the broker evaluates on
+every published message:
+
+1. **Publish.** A publisher sends a persistent message to a topic, for
+   example `poc/news-validate/alice/t-1`. It knows nothing about queues and
+   waits only for the broker's acknowledgement.
+2. **Match.** The broker compares that topic with the subscription on every
+   queue in the VPN. A subscription is matched level by level: a literal
+   level must be equal, `*` matches exactly one level of any value, and `>`
+   at the end matches one or more remaining levels.
+3. **Spool.** For each queue whose subscription matches, the broker places
+   its own copy of the message in that queue. A queue with no match receives
+   nothing. A queue that matches receives the message whether or not its
+   consumer is connected: the copy waits in the queue's spool.
+4. **Deliver and ack.** A consumer bound to the queue receives the message
+   on its callback, handles it (here: verify the token, then read), and acks
+   it; the ack removes that copy from that queue only. Other queues' copies
+   are unaffected. If the consumer disconnects before acking, the message is
+   redelivered when it rebinds.
+
+Because matching happens per queue, the number of consumers that receive an
+event is simply the number of queues whose subscription matches its topic.
+Adding or removing a consumer is adding or removing a queue; no publisher
+changes.
+
+| Published topic | `q.poc.validator` `poc/msg/>` `poc/news/>` | `q.poc.recipient.t-1` `poc/msg-validate/*/t-1` | `q.poc.profiler.alice` `poc/msg-validate/alice/*` | `q.poc.news.<app>` x6 `poc/news-validate/>` |
+|---|---|---|---|---|
+| `poc/msg/alice/t-1` (publisher) | yes | no | no | no |
+| `poc/msg-validate/alice/t-1` (validator) | no | yes | yes | no |
+| `poc/msg-validate/bob/t-1` | no | yes | no | no |
+| `poc/msg-validate/alice/t-2` | no | no | yes | no |
+| `poc/news/alice/t-1` (publisher `--kind news`) | yes | no | no | no |
+| `poc/news-validate/alice/t-1` (validator) | no | no | no | yes, all six |
+| `poc/news-validate/bob/t-9` | no | no | no | yes, all six |
+
+Reading the rows:
+
+- The validator's queue carries two subscriptions, so it attracts every raw
+  message and every raw news event, and nothing from the validated spaces.
+  That is what prevents it from consuming its own output.
+- `poc/msg-validate/*/t-1` matches any sender in thread `t-1`; the `*`
+  consumes exactly the sender level. `poc/msg-validate/alice/*` fixes the
+  sender and leaves the thread open. The same validated message can match
+  both, which is why `alice` in `t-1` lands in two queues.
+- `poc/news-validate/>` has no literal level after the prefix, so every
+  validated news event matches it. Six queues carry that one subscription,
+  so one news event becomes six spooled copies, one per application. Each
+  application acks only its own copy; Kai-Zen being offline never holds up
+  Kai-Go-Mobile.
+- No queue in the `msg` family subscribes to `poc/news-validate/...` and
+  vice versa, so message traffic and news traffic never cross.
+
+In PubSub+ Manager, Queues shows each queue's subscription under its
+*Subscriptions* tab, and the *Messages Queued* count rises on every matching
+queue while its consumer is stopped, which is the spooling in step 3 made
+visible.
 
 ---
 
@@ -301,8 +401,12 @@ PubSub+ Manager (Queues) when a thread-id or sender-id is no longer needed.
 | `obo-validator` | Consumes `q.poc.validator`, republishes each event unchanged to the validated topic. Does not inspect the token. |
 | `obo-recipient --thread-id T` | Consumes `q.poc.recipient.T`, verifies the token, then reads the payload. |
 | `obo-profiler --sender-id A` | Consumes `q.poc.profiler.A`, verifies the token, then reads the payload. |
+| `obo-news-consumer --app X` | One of the six news applications (`Kai-Go-Mobile`, `Kai-Go-Desktop`, `Kai-Signals-Engine`, `Kai-StoreFront`, `Kai-Cowork`, `Kai-Zen`). Consumes `q.poc.news.X`, verifies the token, then reads the payload. |
 
-All five are entry points of one Python package (`src/solace_obo_poc/`),
+`obo-publisher --kind news ...` publishes to `poc/news/A/T` instead of
+`poc/msg/A/T`; everything else about it is the same.
+
+All six are entry points of one Python package (`src/solace_obo_poc/`),
 built on the Solace Python API (`solace-pubsubplus`) and PyJWT.
 
 ---
@@ -342,7 +446,8 @@ MQTT, AMQP, REST, TLS variants), so the issuer is published on host port
 8001 instead of 8000.
 
 ```sh
-docker compose up -d --build          # broker, issuer, validator, recipient (t-1), profiler (alice)
+docker compose up -d --build          # broker, issuer, validator, publisher, recipient (t-1), profiler (alice),
+                                      # news publisher and the six news consumers
 docker compose ps                     # wait until solace shows (healthy): 1-2 minutes
 ```
 
@@ -368,7 +473,7 @@ SOLACE_PASSWORD=...
 Then:
 
 ```sh
-docker compose up -d --build          # issuer, validator, recipient, profiler only
+docker compose up -d --build          # everything except the broker: issuer, validator, publishers, all consumers
 ```
 
 Where the broker runs decides the host name:
@@ -404,7 +509,20 @@ Expected, repeating every 5 seconds with an increasing `seq`:
 
 Every 270 seconds the publisher logs that it is refreshing its token, and the
 `kid`/`jti` in the consumers' lines change accordingly. In PubSub+ Manager,
-Queues shows the three queues with their subscriptions.
+Queues shows the validator, recipient, profiler and six news queues with
+their subscriptions.
+
+**The news flow.** The `news-publisher` service runs alongside with
+`--kind news`, so every 5 seconds one news event goes to
+`poc/news/alice/t-1`, the validator forwards it to
+`poc/news-validate/alice/t-1`, and all six news consumers receive it while
+the recipient and profiler stay silent:
+
+```sh
+docker compose logs -f news-publisher news-kai-go-mobile news-kai-zen     # or any of the six news-* services
+```
+
+Expected on each news consumer: `news-consumer received news seq=N in thread t-1 from alice: 'breaking news from poc in docker' ...`.
 
 **Guaranteed delivery.** Stop the recipient for a while, then start it again
 and watch it receive every event that arrived while it was down:
@@ -423,9 +541,10 @@ SENDER_ID=bob PUBLISH_COUNT=3 docker compose run --rm publisher    # recipient s
 THREAD_ID=t-2 PUBLISH_COUNT=3 docker compose run --rm publisher    # profiler sees it (sender alice), recipient (t-1) does not
 ```
 
-`SENDER_ID`, `THREAD_ID` and `MESSAGE` set the publisher's arguments;
-`PUBLISH_INTERVAL_SECONDS` and `PUBLISH_COUNT` its cadence; and `SENDER_ID`
-and `THREAD_ID` also set the profiler and recipient filters at `up` time.
+`SENDER_ID`, `THREAD_ID` and `MESSAGE` set the publisher's arguments
+(`NEWS_MESSAGE` the news publisher's text); `PUBLISH_INTERVAL_SECONDS` and
+`PUBLISH_COUNT` the cadence of both; and `SENDER_ID` and `THREAD_ID` also set
+the profiler and recipient filters at `up` time.
 Change them in `.env` and `up` again to re-filter. (On PowerShell, set them
 in `.env` rather than as a command prefix.)
 
@@ -457,7 +576,9 @@ uv run obo-issuer                                     # terminal 1
 uv run obo-validator                                  # terminal 2
 uv run obo-recipient --thread-id t-1                  # terminal 3
 uv run obo-profiler --sender-id alice                 # terminal 4
+uv run obo-news-consumer --app Kai-Zen                # terminal 5; repeat per app for all six
 uv run obo-publisher --sender-id alice --thread-id t-1          # one event every 5 s; add --count 3 for a burst
+uv run obo-publisher --kind news --sender-id alice --thread-id t-1   # news events; only the news consumers receive them
 docker compose down
 ```
 
@@ -482,6 +603,7 @@ automatically, and host runs can use `uv run --env-file .env obo-<service>`.
 | `OBO_TOKEN_TTL_SECONDS` | `300` | Token lifetime the issuer grants |
 | `PUBLISH_INTERVAL_SECONDS` | `5` | Seconds between the publisher's events (decimal allowed) |
 | `PUBLISH_COUNT` | `0` | Events to publish before exiting; `0` runs until stopped |
+| `NEWS_MESSAGE` | `breaking news from poc in docker` | Text the compose `news-publisher` service sends (compose only) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every token check and broker call; tokens stay masked |
 
 ---

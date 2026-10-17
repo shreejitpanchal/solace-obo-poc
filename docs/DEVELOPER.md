@@ -21,11 +21,11 @@ Contents
 ## 1. Repository layout
 
 ```
-src/solace_obo_poc/     the application package (one package, five entry points)
+src/solace_obo_poc/     the application package (one package, six entry points)
 tests/                  pytest suite; mirrors the package module for module
 scripts/dev.sh, dev.ps1 the only place that knows how to build, lint, test, scan
 scripts/audit_gate.py   the scan gate shared by both scripts
-docker/Dockerfile       service image (all five entry points)
+docker/Dockerfile       service image (all six entry points)
 docker-compose.yml      local stack: broker (optional), issuer, services
 .env.example            every setting, with the two broker modes
 .github/workflows/      ci.yml (gates) and tag.yml (release on tag)
@@ -43,20 +43,21 @@ Python 3.12, managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates
 | Module | Responsibility | Depends on |
 |---|---|---|
 | `config.py` | Reads settings from environment variables, applies defaults, validates them. Masks the password for logs. | stdlib |
-| `topics.py` | Topic and queue naming, and `validate_level`, the one gate for identifiers that become topic levels. | stdlib |
+| `topics.py` | Topic and queue naming for both event kinds (`msg`, `news`), the `NEWS_CONSUMERS` list, and `validate_level`, the one gate for identifiers that become topic levels. | stdlib |
 | `obo_token.py` | `KeyPair` (issuer side: sign, export JWKS) and `JwksVerifier` (everyone else: verify offline). `TOKEN_PROPERTY` = `obo-token`. | PyJWT, cryptography, httpx |
 | `authz.py` | `authorize_event`: parse topic, verify token, bind `sub` to sender-id, then decode payload. | topics, obo_token |
 | `broker.py` | Wrapper over the Solace Python API. `Broker.publish` (persistent, waits for ack), `Broker.subscribe` (durable queue + topic subscription + ack). `Inbound`/`Outbound` are the SDK-free message shapes. | solace-pubsubplus (imported lazily) |
 | `issuer.py` | FastAPI app: `POST /token`, `GET /.well-known/jwks.json`, `GET /healthz`. Entry point `obo-issuer`. | fastapi, uvicorn, obo_token |
-| `publisher.py` | `fetch_token` (returns `IssuedToken` with expiry), `build_message`, and the timed publish loop with token refresh; entry point `obo-publisher`. | broker, obo_token, topics |
-| `validator.py` | `forward_message` (pure mapping raw topic -> validated topic, token untouched), `make_handler`, entry point `obo-validator`. | broker, topics |
-| `consumer.py` | Shared loop for the two applications: `make_handler` (authorize then `on_event`), `run`. | authz, broker, obo_token |
+| `publisher.py` | `fetch_token` (returns `IssuedToken` with expiry), `build_message` (`--kind msg` or `news` picks the raw space), and the timed publish loop with token refresh; entry point `obo-publisher`. | broker, obo_token, topics |
+| `validator.py` | `forward_message` (pure mapping raw topic -> validated topic of the same kind, token untouched), `make_handler`, entry point `obo-validator`. | broker, topics |
+| `consumer.py` | Shared loop for every consuming application: `make_handler` (authorize then `on_event`), `run`. | authz, broker, obo_token |
 | `recipient.py` | Entry point `obo-recipient --thread-id T`; supplies queue, subscription and `on_event`. | consumer, topics |
 | `profiler.py` | Entry point `obo-profiler --sender-id A`; same shape as recipient. | consumer, topics |
+| `news_consumer.py` | Entry point `obo-news-consumer --app X`, X one of the six `NEWS_CONSUMERS`; queue `q.poc.news.X` on `poc/news-validate/>`. Same shape as recipient. | consumer, topics |
 
 Dependency direction is strictly downwards in this table: nothing below
 `broker.py` imports a service module, and no service imports another service.
-`consumer.py` is the only shared piece between the two applications.
+`consumer.py` is the only shared piece between the consuming applications.
 
 Every module's docstring opens with "where it sits in the flow"; read those
 first when orienting.
@@ -80,20 +81,21 @@ publisher.main
         └─ broker.Broker.publish      persistent publish, waits for ack
 
 validator.main
-  └─ broker.Broker.subscribe(q.poc.validator, ["poc/msg/>"], handler)
+  └─ broker.Broker.subscribe(q.poc.validator, ["poc/msg/>", "poc/news/>"], handler)
         └─ validator.make_handler → handle(Inbound)
               ├─ validator.forward_message
-              │     ├─ topics.parse_topic             sender-id, thread-id from the topic
-              │     └─ Outbound(topic=topics.validated_topic(...), payload unchanged,
+              │     ├─ topics.parse_topic             sender-id, thread-id and space from the topic
+              │     └─ Outbound(topic=topics.validated_topic_for(parts), payload unchanged,
               │                 properties unchanged + "obo-forwarded-at")
               └─ broker.Broker.publish              or log.warning("dropped ...") and return
                  (the token is NOT inspected here; see authz below)
 
-recipient.main / profiler.main
-  ├─ topics.validate_level(thread_id | sender_id)
+recipient.main / profiler.main / news_consumer.main
+  ├─ topics.validate_level(thread_id | sender_id)   (news: --app is a closed choices= list)
   └─ consumer.run(name, queue_name, subscription, on_event)
         ├─ JwksVerifier.from_url                        (once)
-        └─ Broker.subscribe(q.poc.recipient.<T> | q.poc.profiler.<A>, [subscription], handler)
+        └─ Broker.subscribe(q.poc.recipient.<T> | q.poc.profiler.<A> | q.poc.news.<app>,
+                            [subscription], handler)
               └─ consumer.make_handler → handle(Inbound)
                     ├─ authz.authorize_event
                     │     ├─ topics.parse_topic
@@ -226,8 +228,20 @@ only `publisher.fetch_token`. If claims differ in name, change only
 `topics.py` and a console script to `pyproject.toml`. The token gate comes
 for free from `consumer.make_handler`; do not bypass it.
 
-**Change the topic layout.** `RAW_PREFIX`, `VALIDATED_PREFIX` and the
-builders in `topics.py` are the single source; `parse_topic` must stay in
+**Add a news consumer.** Append the name to `NEWS_CONSUMERS` in `topics.py`
+and add a `news-<name>` service to `docker-compose.yml` using the
+`x-news-consumer` anchor. `obo-news-consumer --app <name>` then binds
+`q.poc.news.<name>` on `poc/news-validate/>`; no other code changes.
+`test_news_consumer.py` is parametrised over the list and the README table
+in section 4 lists each queue, so update both.
+
+**Add an event kind.** Add one row to `_PREFIXES` in `topics.py` (raw and
+validated prefix). The publisher's `--kind` and the validator's subscriptions
+and forwarding pick it up automatically; write the consumer for it like the
+news consumer. Update `test_topics.py` alongside.
+
+**Change the topic layout.** `_PREFIXES` (and the `*_PREFIX` constants) and
+the builders in `topics.py` are the single source; `parse_topic` must stay in
 sync. Update `test_topics.py` alongside.
 
 **Pre-provisioned queues.** Set `SOLACE_CREATE_QUEUES=false`; the receiver
