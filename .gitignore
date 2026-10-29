@@ -24,3 +24,6 @@ __pycache__/
 # local secrets / keys
 .env
 *.pem
+
+# editor settings
+.vscode/
