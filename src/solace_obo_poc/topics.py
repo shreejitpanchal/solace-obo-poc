@@ -199,6 +199,39 @@ def news_queue(prefix: str, app: str) -> str:
     return f"{prefix}.news.{validate_level(validate_news_consumer(app), 'news consumer')}"
 
 
+# --- the full queue set, for provisioning ------------------------------------
+
+
+@dataclass(frozen=True)
+class QueueSpec:
+    """One queue to exist on the broker and the topic subscriptions it carries."""
+
+    name: str
+    subscriptions: tuple[str, ...]
+
+
+def queue_specs(
+    prefix: str, thread_id: str | None = None, sender_id: str | None = None
+) -> list[QueueSpec]:
+    """Every POC queue with its subscriptions: validator, six news queues, and, when
+    `thread_id` / `sender_id` are given, the recipient and profiler queues for them.
+
+    This is the single list obo-provision creates on the broker; it is derived
+    from the same builders the consumers use, so the two cannot drift.
+    """
+    specs = [QueueSpec(validator_queue(prefix), tuple(validator_subscriptions()))]
+    if thread_id is not None:
+        specs.append(
+            QueueSpec(recipient_queue(prefix, thread_id), (recipient_subscription(thread_id),))
+        )
+    if sender_id is not None:
+        specs.append(
+            QueueSpec(profiler_queue(prefix, sender_id), (profiler_subscription(sender_id),))
+        )
+    specs.extend(QueueSpec(news_queue(prefix, app), (news_subscription(),)) for app in NEWS_CONSUMERS)
+    return specs
+
+
 # --- parsing inbound topics --------------------------------------------------
 
 

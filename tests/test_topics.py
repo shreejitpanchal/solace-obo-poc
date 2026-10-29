@@ -85,6 +85,28 @@ def test_six_news_consumers_each_get_their_own_queue():
         assert topics.validate_level(app, "app") == app
 
 
+def test_queue_specs_list_every_queue_with_its_subscriptions():
+    specs = {s.name: s.subscriptions for s in topics.queue_specs("q.poc", "t-1", "alice")}
+    assert len(specs) == 9
+    assert specs["q.poc.validator"] == ("poc/msg/>", "poc/news/>")
+    assert specs["q.poc.recipient.t-1"] == ("poc/msg-validate/*/t-1",)
+    assert specs["q.poc.profiler.alice"] == ("poc/msg-validate/alice/*",)
+    for app in topics.NEWS_CONSUMERS:
+        assert specs[f"q.poc.news.{app}"] == ("poc/news-validate/>",)
+
+
+def test_queue_specs_without_ids_cover_only_the_fixed_queues():
+    names = [s.name for s in topics.queue_specs("q.poc")]
+    assert names == ["q.poc.validator"] + [f"q.poc.news.{a}" for a in topics.NEWS_CONSUMERS]
+
+
+def test_queue_specs_reject_unsafe_ids():
+    with pytest.raises(ValueError):
+        topics.queue_specs("q.poc", thread_id="a/b")
+    with pytest.raises(ValueError):
+        topics.queue_specs("q.poc", sender_id=">")
+
+
 @pytest.mark.parametrize("bad", ["Kai-Unknown", "kai-zen", "", "a/b", ">"])
 def test_news_queue_rejects_apps_outside_the_six(bad):
     with pytest.raises(ValueError, match="news consumer"):

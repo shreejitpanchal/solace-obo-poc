@@ -85,7 +85,7 @@ $TArch = if ($env:TARGET_ARCH) { $env:TARGET_ARCH } else { Get-HostArch }
 
 # One binary per service in the POC; names carry the target so the release
 # job's merge-multiple never collides.
-$Components = @('issuer', 'publisher', 'validator', 'recipient', 'profiler', 'news_consumer')
+$Components = @('issuer', 'publisher', 'validator', 'recipient', 'profiler', 'news_consumer', 'provision')
 
 # --- tasks ------------------------------------------------------------------
 # PowerShell returns EVERY uncaptured pipeline value, not just `return`: route

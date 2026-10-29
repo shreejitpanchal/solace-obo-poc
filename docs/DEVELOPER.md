@@ -21,11 +21,11 @@ Contents
 ## 1. Repository layout
 
 ```
-src/solace_obo_poc/     the application package (one package, six entry points)
+src/solace_obo_poc/     the application package (one package, seven entry points)
 tests/                  pytest suite; mirrors the package module for module
 scripts/dev.sh, dev.ps1 the only place that knows how to build, lint, test, scan
 scripts/audit_gate.py   the scan gate shared by both scripts
-docker/Dockerfile       service image (all six entry points)
+docker/Dockerfile       service image (all seven entry points)
 docker-compose.yml      local stack: broker (optional), issuer, services
 .env.example            every setting, with the two broker modes
 .github/workflows/      ci.yml (gates) and tag.yml (release on tag)
@@ -54,6 +54,7 @@ Python 3.12, managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates
 | `recipient.py` | Entry point `obo-recipient --thread-id T`; supplies queue, subscription and `on_event`. | consumer, topics |
 | `profiler.py` | Entry point `obo-profiler --sender-id A`; same shape as recipient. | consumer, topics |
 | `news_consumer.py` | Entry point `obo-news-consumer --app X`, X one of the six `NEWS_CONSUMERS`; queue `q.poc.news.X` on `poc/news-validate/>`. Same shape as recipient. | consumer, topics |
+| `provision.py` | Entry point `obo-provision`: `SempClient` (SEMP v2 over httpx, waits for the broker), `ensure_queue` / `ensure_subscriptions`, and `provision` over `topics.queue_specs`. Sets `respectTtlEnabled` + `maxTtl` on every queue. | config, topics, httpx |
 
 Dependency direction is strictly downwards in this table: nothing below
 `broker.py` imports a service module, and no service imports another service.
@@ -244,10 +245,21 @@ news consumer. Update `test_topics.py` alongside.
 the builders in `topics.py` are the single source; `parse_topic` must stay in
 sync. Update `test_topics.py` alongside.
 
-**Pre-provisioned queues.** Set `SOLACE_CREATE_QUEUES=false`; the receiver
-then uses `DO_NOT_CREATE` and a missing queue fails loudly at bind time. The
-queue must be durable, exclusive (or change `Queue.durable_exclusive_queue`
-in `broker.py`), and carry the subscription from the table in the README.
+**Queue properties (TTL and friends).** The messaging API creates queues
+with broker defaults only, so anything beyond name and subscriptions is set
+by `provision.py` over SEMP v2. To change a property, edit `queue_body`
+(create) and `ttl_body` (update of an existing queue) together, and extend
+`tests/test_provision.py`, whose `FakeSemp` stores whatever is PATCHed. The
+list of queues comes from `topics.queue_specs`, so a new consumer's queue
+is provisioned as soon as its builder is added there.
+
+**Pre-provisioned queues.** Run `obo-provision` against the target broker
+(`SEMP_URL`, `SEMP_USERNAME`, `SEMP_PASSWORD`), or have an administrator
+create the queues from the README table: durable, exclusive (or change
+`Queue.durable_exclusive_queue` in `broker.py`), with the subscription and
+the TTL settings. Then `SOLACE_CREATE_QUEUES=false` makes the receiver use
+`DO_NOT_CREATE`, so a missing queue fails loudly at bind time instead of
+being created without the TTL.
 
 **Per-service broker identities.** Today every service uses the one
 `SOLACE_USERNAME`. To give each its own client-username and ACL, set the

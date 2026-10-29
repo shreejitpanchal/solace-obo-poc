@@ -70,7 +70,7 @@ T_ARCH="${TARGET_ARCH:-$(host_arch)}"
 
 # One binary per service in the POC; names carry the target so the release
 # job's merge-multiple never collides.
-COMPONENTS="issuer publisher validator recipient profiler news_consumer"
+COMPONENTS="issuer publisher validator recipient profiler news_consumer provision"
 
 # --- tasks ------------------------------------------------------------------
 task_build() {

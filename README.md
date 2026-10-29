@@ -329,6 +329,20 @@ instead of being created. `SOLACE_QUEUE_PREFIX` changes the `q.poc` prefix.
 Queues are durable and persist after the consumer disconnects; delete them in
 PubSub+ Manager (Queues) when a thread-id or sender-id is no longer needed.
 
+**Message expiry (24 hours).** Every POC queue is created with
+`respectTtlEnabled` on and `maxTtl` set to `QUEUE_MAX_TTL_SECONDS` (default
+86400), so a message that sits in a queue for more than 24 hours is expired
+by the broker instead of waiting forever for a consumer. The messaging API
+cannot set those properties when a consumer auto-creates its queue, so the
+`provision` compose service (`obo-provision`) runs first and creates or
+updates all nine queues above over SEMP v2 (the broker's management API,
+port 8080 on the local broker) with their subscriptions and TTL settings.
+Every publisher and consumer waits for it to finish. It is idempotent: on
+a stack that already has the queues it only patches the TTL settings and
+adds missing subscriptions, which is also how the validator's existing queue
+picked up `poc/news/>`. In PubSub+ Manager a queue's *Maximum TTL* and
+*Respect TTL* settings show the result.
+
 ### How a queue's topic subscription drives delivery
 
 Nothing in the POC sends a message *to* a queue. Publishers only publish to
@@ -403,11 +417,13 @@ visible.
 | `obo-profiler --sender-id A` | Consumes `q.poc.profiler.A`, verifies the token, then reads the payload. |
 | `obo-news-consumer --app X` | One of the six news applications (`Kai-Go-Mobile`, `Kai-Go-Desktop`, `Kai-Signals-Engine`, `Kai-StoreFront`, `Kai-Cowork`, `Kai-Zen`). Consumes `q.poc.news.X`, verifies the token, then reads the payload. |
 
+| `obo-provision [--thread-id T] [--sender-id A]` | One-shot. Creates every queue in section 4 over SEMP v2 with its subscriptions, `respectTtlEnabled` and `maxTtl=QUEUE_MAX_TTL_SECONDS` (24 h), then exits. Idempotent. |
+
 `obo-publisher --kind news ...` publishes to `poc/news/A/T` instead of
 `poc/msg/A/T`; everything else about it is the same.
 
-All six are entry points of one Python package (`src/solace_obo_poc/`),
-built on the Solace Python API (`solace-pubsubplus`) and PyJWT.
+All seven are entry points of one Python package (`src/solace_obo_poc/`),
+built on the Solace Python API (`solace-pubsubplus`), PyJWT and httpx.
 
 ---
 
@@ -446,8 +462,8 @@ MQTT, AMQP, REST, TLS variants), so the issuer is published on host port
 8001 instead of 8000.
 
 ```sh
-docker compose up -d --build          # broker, issuer, validator, publisher, recipient (t-1), profiler (alice),
-                                      # news publisher and the six news consumers
+docker compose up -d --build          # broker, issuer, provision (queues + 24 h TTL), validator, publisher,
+                                      # recipient (t-1), profiler (alice), news publisher, six news consumers
 docker compose ps                     # wait until solace shows (healthy): 1-2 minutes
 ```
 
@@ -572,6 +588,7 @@ docker compose down                   # stop everything; add -v to drop the brok
 
 ```sh
 docker compose up -d solace                           # broker only, on localhost:55555
+uv run obo-provision --sender-id alice --thread-id t-1   # once: the nine queues with a 24 h TTL (SEMP on :8080)
 uv run obo-issuer                                     # terminal 1
 uv run obo-validator                                  # terminal 2
 uv run obo-recipient --thread-id t-1                  # terminal 3
@@ -604,6 +621,10 @@ automatically, and host runs can use `uv run --env-file .env obo-<service>`.
 | `PUBLISH_INTERVAL_SECONDS` | `5` | Seconds between the publisher's events (decimal allowed) |
 | `PUBLISH_COUNT` | `0` | Events to publish before exiting; `0` runs until stopped |
 | `NEWS_MESSAGE` | `breaking news from poc in docker` | Text the compose `news-publisher` service sends (compose only) |
+| `QUEUE_MAX_TTL_SECONDS` | `86400` | Message expiry `obo-provision` sets on every queue (`maxTtl`, with `respectTtlEnabled`); 24 hours |
+| `SEMP_URL` | `http://localhost:8080` | Broker management (SEMP v2) URL for `obo-provision` (`http://solace:8080` inside compose) |
+| `SEMP_USERNAME` / `SEMP_PASSWORD` | `admin` / `admin` | SEMP credentials (compose defaults the password to `SOLACE_ADMIN_PASSWORD`) |
+| `PROVISION_TIMEOUT_SECONDS` | `180` | How long `obo-provision` waits for SEMP to answer while the broker boots |
 | `LOG_LEVEL` | `INFO` | `DEBUG` logs every token check and broker call; tokens stay masked |
 
 ---

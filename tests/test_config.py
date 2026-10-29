@@ -1,6 +1,44 @@
 import pytest
 
-from solace_obo_poc.config import ConfigError, broker_config, publisher_config, token_config
+from solace_obo_poc.config import (
+    ConfigError,
+    broker_config,
+    publisher_config,
+    semp_config,
+    token_config,
+)
+
+
+def test_semp_defaults_give_a_24_hour_queue_ttl():
+    cfg = semp_config({})
+    assert cfg.url == "http://localhost:8080"
+    assert cfg.username == "admin"
+    assert cfg.max_ttl_seconds == 86400
+    assert cfg.timeout_seconds == 180.0
+    overridden = semp_config(
+        {"SEMP_URL": "https://broker:1943/", "QUEUE_MAX_TTL_SECONDS": "3600", "SEMP_PASSWORD": "s3"}
+    )
+    assert overridden.url == "https://broker:1943/"
+    assert overridden.max_ttl_seconds == 3600
+    assert overridden.password == "s3"
+
+
+def test_semp_masked_never_exposes_password():
+    masked = semp_config({"SEMP_PASSWORD": "s3cret"}).masked()
+    assert masked["password"] == "***"
+    assert "s3cret" not in str(masked)
+
+
+@pytest.mark.parametrize("raw", ["day", "", "-1", "1.5"])
+def test_queue_ttl_rejects_bad_values(raw):
+    with pytest.raises(ConfigError, match="QUEUE_MAX_TTL_SECONDS"):
+        semp_config({"QUEUE_MAX_TTL_SECONDS": raw})
+
+
+@pytest.mark.parametrize("raw", ["soon", "0", "-5"])
+def test_provision_timeout_rejects_bad_values(raw):
+    with pytest.raises(ConfigError, match="PROVISION_TIMEOUT_SECONDS"):
+        semp_config({"PROVISION_TIMEOUT_SECONDS": raw})
 
 
 def test_broker_defaults_apply_only_when_unset():

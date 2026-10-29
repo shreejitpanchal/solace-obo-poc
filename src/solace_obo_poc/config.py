@@ -78,6 +78,59 @@ def broker_config(env: Mapping[str, str] | None = None) -> BrokerConfig:
     )
 
 
+@dataclass(frozen=True)
+class SempConfig:
+    """Broker management (SEMP v2) settings used by obo-provision to create the queues."""
+
+    url: str  # base URL of the broker's SEMP endpoint, e.g. http://localhost:8080
+    username: str
+    password: str
+    max_ttl_seconds: int  # message expiry applied to every POC queue (0 = no limit)
+    timeout_seconds: float  # how long to wait for SEMP to answer while the broker boots
+
+    def masked(self) -> dict[str, str]:
+        """Safe to log: the password is never echoed."""
+        return {
+            "url": self.url,
+            "username": self.username,
+            "password": "***",
+            "max_ttl_seconds": str(self.max_ttl_seconds),
+            "timeout_seconds": str(self.timeout_seconds),
+        }
+
+
+def semp_config(env: Mapping[str, str] | None = None) -> SempConfig:
+    """SEMP_URL/USERNAME/PASSWORD, QUEUE_MAX_TTL_SECONDS (default 86400 = 24 h), PROVISION_TIMEOUT_SECONDS."""
+    env = os.environ if env is None else env
+    raw_ttl = env.get("QUEUE_MAX_TTL_SECONDS", "86400")
+    try:
+        ttl = int(raw_ttl)
+    except ValueError as exc:
+        raise ConfigError(
+            f"QUEUE_MAX_TTL_SECONDS must be an integer number of seconds, got {raw_ttl!r}; "
+            "unset it for the default of 86400 (24 hours)"
+        ) from exc
+    if ttl < 0:
+        raise ConfigError(f"QUEUE_MAX_TTL_SECONDS must not be negative, got {ttl}")
+    raw_timeout = env.get("PROVISION_TIMEOUT_SECONDS", "180")
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise ConfigError(
+            f"PROVISION_TIMEOUT_SECONDS must be a number of seconds, got {raw_timeout!r}; "
+            "unset it for the default of 180"
+        ) from exc
+    if timeout <= 0:
+        raise ConfigError(f"PROVISION_TIMEOUT_SECONDS must be positive, got {timeout}")
+    return SempConfig(
+        url=env.get("SEMP_URL", "http://localhost:8080"),
+        username=env.get("SEMP_USERNAME", "admin"),
+        password=env.get("SEMP_PASSWORD", "admin"),
+        max_ttl_seconds=ttl,
+        timeout_seconds=timeout,
+    )
+
+
 def token_config(env: Mapping[str, str] | None = None) -> TokenConfig:
     env = os.environ if env is None else env
     raw_ttl = env.get("OBO_TOKEN_TTL_SECONDS", "300")

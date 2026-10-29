@@ -1,7 +1,7 @@
-# Whole POC in containers: issuer, publisher (one event every
-# PUBLISH_INTERVAL_SECONDS), news publisher (same cadence, kind news),
-# validator, recipient, user-profiler, the six news consumers, and
-# optionally the broker itself.
+# Whole POC in containers: issuer, provision (one-shot: queues with a 24 h
+# message TTL over SEMP), publisher (one event every PUBLISH_INTERVAL_SECONDS),
+# news publisher (same cadence, kind news), validator, recipient,
+# user-profiler, the six news consumers, and optionally the broker itself.
 #
 # Broker, two modes, chosen in .env:
 #   local     COMPOSE_PROFILES=local-broker (the default in .env.example): the
@@ -24,25 +24,28 @@
 # Broker.connect retries for up to three minutes instead, which also covers
 # the local container's 1-2 minute boot.
 
+# Shared environment; the provision service extends it with SEMP settings.
+x-env: &env
+  SOLACE_HOST: ${SOLACE_HOST:-tcp://solace:55555}
+  SOLACE_VPN: ${SOLACE_VPN:-default}
+  SOLACE_USERNAME: ${SOLACE_USERNAME:-default}
+  SOLACE_PASSWORD: ${SOLACE_PASSWORD:-default}
+  SOLACE_QUEUE_PREFIX: ${SOLACE_QUEUE_PREFIX:-q.poc}
+  SOLACE_CREATE_QUEUES: ${SOLACE_CREATE_QUEUES:-true}
+  OBO_ISSUER_URL: http://issuer:8000
+  OBO_ISSUER: ${OBO_ISSUER:-solace-obo-poc-issuer}
+  OBO_AUDIENCE: ${OBO_AUDIENCE:-poc}
+  OBO_TOKEN_TTL_SECONDS: ${OBO_TOKEN_TTL_SECONDS:-300}
+  PUBLISH_INTERVAL_SECONDS: ${PUBLISH_INTERVAL_SECONDS:-5}
+  PUBLISH_COUNT: ${PUBLISH_COUNT:-0}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
 x-app: &app
   build:
     context: .
     dockerfile: docker/Dockerfile
   image: solace-obo-poc:dev
-  environment:
-    SOLACE_HOST: ${SOLACE_HOST:-tcp://solace:55555}
-    SOLACE_VPN: ${SOLACE_VPN:-default}
-    SOLACE_USERNAME: ${SOLACE_USERNAME:-default}
-    SOLACE_PASSWORD: ${SOLACE_PASSWORD:-default}
-    SOLACE_QUEUE_PREFIX: ${SOLACE_QUEUE_PREFIX:-q.poc}
-    SOLACE_CREATE_QUEUES: ${SOLACE_CREATE_QUEUES:-true}
-    OBO_ISSUER_URL: http://issuer:8000
-    OBO_ISSUER: ${OBO_ISSUER:-solace-obo-poc-issuer}
-    OBO_AUDIENCE: ${OBO_AUDIENCE:-poc}
-    OBO_TOKEN_TTL_SECONDS: ${OBO_TOKEN_TTL_SECONDS:-300}
-    PUBLISH_INTERVAL_SECONDS: ${PUBLISH_INTERVAL_SECONDS:-5}
-    PUBLISH_COUNT: ${PUBLISH_COUNT:-0}
-    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  environment: *env
   extra_hosts:
     - "host.docker.internal:host-gateway" # lets Linux hosts reach a broker on the host machine
 
@@ -53,6 +56,7 @@ x-news-consumer: &news-consumer
   entrypoint: ["obo-news-consumer"]
   depends_on:
     issuer: { condition: service_healthy }
+    provision: { condition: service_completed_successfully }
   restart: on-failure
 
 services:
@@ -124,6 +128,24 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot: creates every POC queue over SEMP v2 with its subscriptions and
+  # a 24-hour message TTL (QUEUE_MAX_TTL_SECONDS), then exits 0. Every
+  # publisher and consumer waits for it, so no message is published before
+  # its queue exists and no consumer creates a queue without the TTL. It
+  # retries SEMP for PROVISION_TIMEOUT_SECONDS to cover the broker's boot.
+  provision:
+    <<: *app
+    container_name: solace-obo-poc-provision
+    entrypoint: ["obo-provision"]
+    command: ["--sender-id", "${SENDER_ID:-alice}", "--thread-id", "${THREAD_ID:-t-1}"]
+    environment:
+      <<: *env
+      SEMP_URL: ${SEMP_URL:-http://solace:8080}
+      SEMP_USERNAME: ${SEMP_USERNAME:-admin}
+      SEMP_PASSWORD: ${SEMP_PASSWORD:-${SOLACE_ADMIN_PASSWORD:-admin}}
+      QUEUE_MAX_TTL_SECONDS: ${QUEUE_MAX_TTL_SECONDS:-86400}
+      PROVISION_TIMEOUT_SECONDS: ${PROVISION_TIMEOUT_SECONDS:-180}
+
   validator:
     <<: *app
     container_name: solace-obo-poc-validator
@@ -131,6 +153,7 @@ services:
     command: []
     depends_on:
       issuer: { condition: service_healthy }
+      provision: { condition: service_completed_successfully }
     restart: on-failure
 
   recipient:
@@ -140,6 +163,7 @@ services:
     command: ["--thread-id", "${THREAD_ID:-t-1}"]
     depends_on:
       issuer: { condition: service_healthy }
+      provision: { condition: service_completed_successfully }
     restart: on-failure
 
   profiler:
@@ -149,6 +173,7 @@ services:
     command: ["--sender-id", "${SENDER_ID:-alice}"]
     depends_on:
       issuer: { condition: service_healthy }
+      provision: { condition: service_completed_successfully }
     restart: on-failure
 
   # Runs continuously: one event every PUBLISH_INTERVAL_SECONDS as SENDER_ID
@@ -167,6 +192,7 @@ services:
       - "${MESSAGE:-hello from poc in docker}"
     depends_on:
       issuer: { condition: service_healthy }
+      provision: { condition: service_completed_successfully }
     restart: on-failure
 
   # Same publisher, kind news: one news event every PUBLISH_INTERVAL_SECONDS
@@ -188,6 +214,7 @@ services:
       - "${NEWS_MESSAGE:-breaking news from poc in docker}"
     depends_on:
       issuer: { condition: service_healthy }
+      provision: { condition: service_completed_successfully }
     restart: on-failure
 
   # The six news consumers, one container and one queue each.
